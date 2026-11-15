@@ -72,6 +72,10 @@ jobs:
     needs: build
     runs-on: self-hosted
     timeout-minutes: 20
+    # On a Windows laptop this uses Git Bash, so the same scripts work everywhere.
+    defaults:
+      run:
+        shell: bash
     steps:
       # The scripts come from your main branch, never from the PR, so a PR
       # can't change what runs on your laptop. Only the previews/ folder is
@@ -81,6 +85,10 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: previews
           persist-credentials: false
+
+      # Git on Windows can turn line endings into CRLF, which breaks bash scripts.
+      - name: Fix line endings
+        run: sed -i 's/\r$//' previews/scripts/*.sh previews/k8s/*.yaml
 
       - name: Deploy the preview
         id: deploy
@@ -126,12 +134,18 @@ jobs:
     if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: self-hosted
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: previews
           persist-credentials: false
+
+      - name: Fix line endings
+        run: sed -i 's/\r$//' previews/scripts/*.sh previews/k8s/*.yaml
 
       - name: Delete the preview
         env:
