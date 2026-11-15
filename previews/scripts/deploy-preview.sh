@@ -119,10 +119,31 @@ if ! kubectl -n "$NS" rollout status deploy/postgres --timeout=180s \
   exit 1
 fi
 
-echo "==> Ready: ${URL}"
-echo "    Sign in: admin@preview.local / (kubectl -n ${NS} get secret preview-secrets -o jsonpath='{.data.SUPER_ADMIN_PASSWORD}' | base64 -d)"
+# 7. A ready-made login. Ziki only creates accounts in its seed script, which
+#    needs dev tools the app image doesn't have, so create the admin straight
+#    in the preview's own database. Same bcrypt format Ziki checks passwords
+#    with. Safe to run again: it just resets the same account.
+ADMIN_EMAIL="admin@example.com"
+ADMIN_PASSWORD="$(kubectl -n "$NS" get secret preview-secrets -o jsonpath='{.data.SUPER_ADMIN_PASSWORD}' | base64 -d)"
+echo "==> Creating the preview login"
+kubectl -n "$NS" exec -i deploy/postgres -- \
+  psql -v ON_ERROR_STOP=1 -q -U ziki -d ziki -v pw="$ADMIN_PASSWORD" -v em="$ADMIN_EMAIL" <<'SQL'
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+INSERT INTO "User" (id, name, email, "passwordHash", role, "emailVerified")
+VALUES ('preview-admin', 'Preview Admin', :'em', crypt(:'pw', gen_salt('bf', 12)), 'super_admin', now())
+ON CONFLICT (email) DO UPDATE
+  SET "passwordHash" = EXCLUDED."passwordHash", role = 'super_admin';
+SQL
 
-# Hand the URL to GitHub Actions if we're running there.
+echo "==> Ready: ${URL}"
+echo "    Sign in: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}"
+
+# Hand the details to GitHub Actions if we're running there.
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-  { echo "url=${URL}"; echo "namespace=${NS}"; } >> "$GITHUB_OUTPUT"
+  {
+    echo "url=${URL}"
+    echo "namespace=${NS}"
+    echo "admin_email=${ADMIN_EMAIL}"
+    echo "admin_password=${ADMIN_PASSWORD}"
+  } >> "$GITHUB_OUTPUT"
 fi
