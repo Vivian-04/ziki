@@ -106,21 +106,40 @@ jobs:
           URL: ${{ steps.deploy.outputs.url }}
           NS: ${{ steps.deploy.outputs.namespace }}
           SHA: ${{ needs.build.outputs.sha }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          ADMIN_EMAIL: ${{ steps.deploy.outputs.admin_email }}
+          ADMIN_PASSWORD: ${{ steps.deploy.outputs.admin_password }}
         with:
           script: |
             const marker = '<!-- ziki-preview -->';
+            const e = process.env;
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const commitUrl = `${context.serverUrl}/${owner}/${repo}/commit/${e.SHA}`;
             const body = [
               marker,
               '### Preview ready',
               '',
-              `**${process.env.URL}**`,
+              `**${e.URL}**`,
               '',
-              `Commit \`${process.env.SHA.slice(0, 7)}\` · namespace \`${process.env.NS}\` · own database`,
+              '| Sign in | |',
+              '| --- | --- |',
+              `| Email | \`${e.ADMIN_EMAIL}\` |`,
+              `| Password | \`${e.ADMIN_PASSWORD}\` |`,
               '',
-              'Sign in as `admin@preview.local`. Ask the preview owner for the password.',
-              'The first load can take a minute while the app starts.',
+              'Throwaway login for this preview only. Its database is deleted when the PR closes.',
+              'The first load after a pause can take a minute while the app starts.',
+              '',
+              '<details><summary>How this preview was made</summary>',
+              '',
+              `1. This PR got commit [\`${e.SHA.slice(0, 7)}\`](${commitUrl}).`,
+              `2. GitHub Actions built its Docker image: \`${e.IMAGE}\` ([run](${runUrl})).`,
+              `3. The self-hosted runner deployed it to Kubernetes namespace \`${e.NS}\`: the app, its own empty Postgres, and a tunnel for the public link.`,
+              '4. The app ran its database migrations on start, then a preview login was created.',
+              '5. This comment was posted. New commits update it; closing the PR deletes everything.',
+              '',
+              '</details>',
             ].join('\n');
-            const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
             const mine = comments.find(c => c.body && c.body.includes(marker));
