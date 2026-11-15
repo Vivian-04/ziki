@@ -242,7 +242,7 @@ spec:
             # Google OAuth won't accept a random preview subdomain, so testers
             # sign in with email/password instead.
             - { name: AUTH_PASSWORD_LOGIN, value: "true" }
-            - { name: SUPER_ADMIN_EMAIL, value: "admin@preview.local" }
+            - { name: SUPER_ADMIN_EMAIL, value: "admin@example.com" }
             # Empty DB + this flag = demo data is loaded. Safe ONLY because the
             # DB is throwaway. Never copy this to a real deployment.
             - { name: SEED_DEMO_DATA_IN_PRODUCTION, value: "true" }
