@@ -1,0 +1,173 @@
+# Automatic PR previews that run entirely on GitHub's machines.
+# No laptop, no Docker Desktop, no self-hosted runner.
+#
+#   PR opened / new commit -> build the PR's image
+#                          -> start a throwaway Kubernetes cluster (kind) on a GitHub runner
+#                          -> deploy the preview there: app + its own Postgres + public tunnel
+#                          -> comment the link and a login on the PR
+#                          -> keep it up for PREVIEW_MINUTES (default 45), then it ends
+#   New commit or PR closed -> the running preview is stopped
+#
+# Needs the previews/ folder on the PR's base branch (main).
+# Optional repo variable PREVIEW_MINUTES (max about 300).
+name: PR preview (cloud)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+# A new commit, or closing the PR, stops the running preview.
+concurrency:
+  group: pr-preview-cloud-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+jobs:
+  build:
+    # Only PRs made inside this repo, never from other people's forks.
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      image: ${{ steps.names.outputs.image }}
+      sha: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Work out the image name
+        id: names
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner_lc}/ziki-previews:pr-${PR}-${SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.names.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+  preview:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      MINUTES: ${{ vars.PREVIEW_MINUTES || '45' }}
+    steps:
+      # Scripts come from the base branch, never from the PR.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: previews
+          persist-credentials: false
+
+      - name: Start a throwaway Kubernetes cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: previews
+
+      - name: Deploy the preview
+        id: deploy
+        env:
+          PREVIEW_TUNNEL: "1"
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ needs.build.outputs.sha }}
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: bash previews/scripts/deploy-preview.sh "$REPO" "$PR" "$SHA" "$IMAGE"
+
+      - name: Comment the link on the PR
+        uses: actions/github-script@v7
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          NS: ${{ steps.deploy.outputs.namespace }}
+          SHA: ${{ needs.build.outputs.sha }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          ADMIN_EMAIL: ${{ steps.deploy.outputs.admin_email }}
+          ADMIN_PASSWORD: ${{ steps.deploy.outputs.admin_password }}
+        with:
+          script: |
+            const marker = '<!-- ziki-preview -->';
+            const e = process.env;
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const commitUrl = `${context.serverUrl}/${owner}/${repo}/commit/${e.SHA}`;
+            const until = new Date(Date.now() + Number(e.MINUTES) * 60000).toISOString().slice(11, 16);
+            const body = [
+              marker,
+              '### Preview ready',
+              '',
+              `**${e.URL}**`,
+              '',
+              '| Sign in | |',
+              '| --- | --- |',
+              `| Email | \`${e.ADMIN_EMAIL}\` |`,
+              `| Password | \`${e.ADMIN_PASSWORD}\` |`,
+              '',
+              `Up until about **${until} UTC** (${e.MINUTES} minutes). Throwaway login and database, deleted afterwards.`,
+              '',
+              '<details><summary>How this preview was made</summary>',
+              '',
+              `1. This PR got commit [\`${e.SHA.slice(0, 7)}\`](${commitUrl}).`,
+              `2. GitHub Actions built its Docker image: \`${e.IMAGE}\` ([run](${runUrl})).`,
+              '3. A throwaway Kubernetes cluster started on a GitHub runner.',
+              `4. The preview was deployed to namespace \`${e.NS}\`: the app, its own empty Postgres, and a tunnel for the public link.`,
+              '5. The app ran its database migrations on start, then a preview login was created.',
+              '6. This comment was posted. A new commit replaces the preview; closing the PR ends it.',
+              '',
+              '</details>',
+            ].join('\n');
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const mine = comments.find(c => c.body && c.body.includes(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Keep the preview up
+        run: sleep $(( MINUTES * 60 ))
+
+      - name: Mark the preview as ended
+        if: always() && steps.deploy.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- ziki-preview -->';
+            const body = `${marker}\n### Preview ended\n\nThis preview has been shut down and its database deleted. Push a new commit to get a fresh one.`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const mine = comments.find(c => c.body && c.body.includes(marker));
+            if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+
+  # Closing the PR starts this run, which (through concurrency) stops the running preview.
+  closed:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "PR closed; any running preview for it has been stopped."
