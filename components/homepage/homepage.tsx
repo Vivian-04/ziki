@@ -131,7 +131,10 @@ function Homepage({ signedIn = false }: { signedIn?: boolean }) {
         >
           <div className="hero-grid" />
           <div className="hero-frame-top">
-            <span>Human + AI workflows</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
+              Human + AI workflows
+              <span className="route-chip">Preview</span>
+            </span>
             <a href="#how-it-works">Explore the product <span>↗</span></a>
           </div>
 
