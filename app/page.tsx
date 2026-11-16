@@ -17,8 +17,11 @@ export default function HomePage() {
           aria-label="Main navigation"
         >
           <div className="flex h-16 items-center justify-between">
-            <div className="flex items-center">
+            <div className="flex items-center gap-2">
               <BrandLockup href="/" size="md" />
+              <span className="inline-flex items-center rounded-full bg-teal-50 px-2 py-0.5 text-xs font-semibold text-teal-700 ring-1 ring-inset ring-teal-600/20">
+                Preview
+              </span>
             </div>
 
             <div className="hidden md:flex md:items-center md:gap-8">
