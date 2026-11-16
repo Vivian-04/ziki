@@ -1,0 +1,301 @@
+# One Ziki server preview = everything below, inside its own namespace.
+# deploy-preview.sh fills in the placeholder values below and applies it.
+# The namespace itself and the secrets are created by the script, not here.
+#
+#   ${NS}      e.g. pr-12-1a2b3c4d5e   (same naming as lib/previews/address.ts)
+#   ${HOST}    e.g. pr-12-1a2b3c4d5e.preview.ziki.dev
+#   ${IMAGE}   e.g. ghcr.io/emerjent/ziki-previews:1a2b3c4d5e-<sha>
+#   ${SCHEME}  http or https
+#   ${SHA}     the commit being previewed
+
+# ---------- Guardrails: cap what one preview can use ----------
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: preview-quota
+  namespace: ${NS}
+spec:
+  hard:
+    pods: "4"
+    requests.cpu: "1"
+    requests.memory: 1536Mi
+    limits.cpu: "2"
+    limits.memory: 2Gi
+    persistentvolumeclaims: "0"
+    services.loadbalancers: "0"
+    services.nodeports: "0"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: preview-defaults
+  namespace: ${NS}
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+---
+# ---------- Guardrails: network ----------
+# Nothing gets in except Traefik (the ingress in kube-system) to the app,
+# and the app to Postgres.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ${NS}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app-ingress
+  namespace: ${NS}
+spec:
+  podSelector:
+    matchLabels: { app: ziki }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 3000
+---
+# The app may reach: DNS, its own Postgres, and the public internet.
+# It may NOT reach private ranges (other previews, the node, cloud metadata).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app-egress
+  namespace: ${NS}
+spec:
+  podSelector:
+    matchLabels: { app: ziki }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    - to:
+        - podSelector:
+            matchLabels: { app: postgres }
+      ports:
+        - port: 5432
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: ${NS}
+spec:
+  podSelector:
+    matchLabels: { app: postgres }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: ziki }
+      ports:
+        - port: 5432
+---
+# ---------- Throwaway Postgres ----------
+# emptyDir = the data lives only as long as the pod. That's the point.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: ${NS}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70        # the postgres user in the alpine image
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: ziki }
+            - { name: POSTGRES_DB, value: ziki }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: preview-secrets, key: PG_PASSWORD }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ziki", "-d", "ziki"]
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: run, mountPath: /var/run/postgresql }
+      volumes:
+        - name: data
+          emptyDir: { sizeLimit: 1Gi }
+        - name: run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ${NS}
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+---
+# ---------- The app (the PR's Docker image) ----------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: ${NS}
+  labels: { app: ziki }
+  annotations:
+    ziki.dev/commit: "${SHA}"
+spec:
+  replicas: 1
+  # Recreate, not rolling: a second copy during rollout would blow the quota,
+  # and two copies racing migrations on one DB is a bad idea anyway.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: ziki }
+  template:
+    metadata:
+      labels: { app: ziki }
+      annotations:
+        ziki.dev/commit: "${SHA}"
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: ghcr-pull     # harmless if missing and the image is public
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        # Ziki runs migrations on start, so wait for the DB first instead of
+        # crash-looping until Postgres is up.
+        - name: wait-for-db
+          image: postgres:16-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -U ziki; do sleep 2; done"]
+          securityContext:
+            runAsUser: 70
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+      containers:
+        - name: app
+          image: ${IMAGE}
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - secretRef: { name: preview-secrets }
+          env:
+            # Next.js standalone binds to $HOSTNAME; Kubernetes sets that to the
+            # pod name, so force all interfaces.
+            - { name: HOSTNAME, value: "0.0.0.0" }
+            - { name: PORT, value: "3000" }
+            - { name: AUTH_URL, value: "${SCHEME}://${HOST}/api/auth" }
+            - { name: NEXTAUTH_URL, value: "${SCHEME}://${HOST}/api/auth" }
+            - { name: AUTH_TRUST_HOST, value: "true" }
+            # Google OAuth won't accept a random preview subdomain, so testers
+            # sign in with email/password instead.
+            - { name: AUTH_PASSWORD_LOGIN, value: "true" }
+            - { name: SUPER_ADMIN_EMAIL, value: "admin@example.com" }
+            # Empty DB + this flag = demo data is loaded. Safe ONLY because the
+            # DB is throwaway. Never copy this to a real deployment.
+            - { name: SEED_DEMO_DATA_IN_PRODUCTION, value: "true" }
+            - { name: BACKFILL_POINTS_ON_START, value: "0" }
+            - { name: TRUSTED_PROXY_HOPS, value: "1" }
+            - { name: GIT_COMMIT, value: "${SHA}" }
+          startupProbe:          # migrations + seed can take a while
+            httpGet: { path: /api/health, port: 3000 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          securityContext:
+            runAsUser: 1000      # the node user Ziki's Dockerfile switches to
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  namespace: ${NS}
+spec:
+  selector: { app: ziki }
+  ports:
+    - port: 80
+      targetPort: 3000
+---
+# ---------- Public URL ----------
+# k3s ships Traefik as its ingress controller.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app
+  namespace: ${NS}
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: ${HOST}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80
