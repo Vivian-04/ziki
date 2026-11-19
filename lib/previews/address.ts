@@ -24,3 +24,15 @@ export function previewBranch(repository: string, pullNumber: number): string {
 export function previewUrl(repository: string, pullNumber: number, pagesProject = DEFAULT_PAGES_PROJECT): string {
   return `https://${previewBranch(repository, pullNumber)}.${pagesProject}.pages.dev`;
 }
+/**
+ * The pull request number a project's main-branch preview uses
+ * (#project-previews). Real pull requests start at 1, so 0 can't clash with
+ * one, and the builder's branch becomes `pr-0-<repo id>`: one fixed address
+ * per repository, updated with each new main commit.
+ */
+export const MAIN_BRANCH_PULL_NUMBER = 0;
+
+/** The address of the project's main-branch preview for `owner/name`. */
+export function projectPreviewUrl(repository: string, pagesProject = DEFAULT_PAGES_PROJECT): string {
+  return previewUrl(repository, MAIN_BRANCH_PULL_NUMBER, pagesProject);
+}
