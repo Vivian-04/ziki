@@ -1,4 +1,5 @@
 import { trackFilter } from "@/lib/marketing/track";
+import { needsPlanReview } from "@/lib/difficulty";
 import { PRODUCT_TRACK } from "@/lib/marketing/track";
 import { createHash } from "node:crypto";
 import { prisma } from "@/lib/prisma";
@@ -44,6 +45,8 @@ import { dollarsToZiks } from "@/lib/coins/math";
 import { commentPreview } from "@/lib/activity-log";
 import { absoluteUrl } from "@/lib/site-url";
 import { openAgentRequests } from "@/lib/agent-requests";
+import { openAlertFor } from "@/lib/agents/work-alert-answer";
+import type { WorkAlertView } from "@/lib/agents/work-alerts";
 import { issuePath } from "@/lib/issue-ref";
 import { ideaPath, projectPath, projectRef } from "@/lib/project-paths";
 import { contestsIn, liveStakesOf, sweepStakes } from "@/lib/agent-api/stakes";
@@ -155,6 +158,12 @@ export type WorkFeed = {
   brief?: AgentBrief | null;
   /** What Ziki asks of the agent right now, in plain words. */
   ask: string[];
+  /**
+   * A work alert for this agent in this project (#work-alerts): work its role
+   * can do has stopped moving or is piling up. Tell your person and report
+   * their answer; null when there is none.
+   */
+  alert: WorkAlertView | null;
   inbox: { unread: number; path: string };
   counts: Partial<Record<WorkKind, number>>;
   /**
@@ -958,7 +967,6 @@ async function loadFacts(ids: string[]): Promise<Map<string, IssueFacts>> {
       assigneeId: true,
       createdByAgentId: true,
       pullRequestUrl: true,
-      outsideWork: { select: { agentId: true } },
       createdByAgent: { select: { ownerUserId: true } },
       claims: { select: { status: true, releasedAt: true, releaseReason: true, beneficiaryUserId: true, agentId: true, dispatcherUserId: true, agent: { select: { ownerUserId: true } } } },
       deliveries: { select: { pullRequestUrl: true, agentId: true } },
@@ -976,7 +984,6 @@ async function loadFacts(ids: string[]): Promise<Map<string, IssueFacts>> {
         assigneeId: bug.assigneeId,
         createdByAgentId: bug.createdByAgentId,
         createdByAgent: bug.createdByAgent,
-        outsideWork: bug.outsideWork,
         pullRequestUrl: bug.pullRequestUrl,
         // #force-merge: the claim a force-merged fix was done under is released at the merge, but its agent still
         // stands where the holder does, so it isn't asked to judge or report on its own work.
@@ -1001,7 +1008,8 @@ async function agentWork(agent: AgentContext, projectId: string, offerWindowSeco
   const [offers, reviewOffers, jobReviewOffers, claims, unread] = await Promise.all([
     prisma.issueClaim.findMany({
       where: { agentId: agent.agentId, status: "offered", releasedAt: null, offeredAt: { gt: offerCutoff }, bug: { projectId, isDeleted: false, ...trackFilter(track) } },
-      select: { id: true, offeredAt: true, bug: { select: { id: true, number: true, title: true } } },
+      // How it was offered: an awarded bid, an admin's assignment, or else a proactive offer (#proactive-offers).
+      select: { id: true, offeredAt: true, dispatcherUserId: true, awardedBid: { select: { id: true } }, bug: { select: { id: true, number: true, title: true, difficulty: true } } },
     }),
     prisma.reviewOffer.findMany({
       where: { agentId: agent.agentId, status: "offered", offeredAt: { gt: reviewCutoff }, bug: { projectId, isDeleted: false, ...trackFilter(track) } },
@@ -1088,9 +1096,21 @@ export function itemsFor(agent: AgentContext, work: ProjectWork, mine: AgentWork
       kind: "offer",
       key: `offer:${offer.id}`,
       title: `Accept the offer to fix #${offer.bug.number}`,
-      detail: mine.askFirst
-        ? "Your bid on this issue was awarded. Your owner chose Ask me first, so it waits for their one-tap yes (Accept on the issue page's Your turn card): tell them, and carry on meanwhile."
-        : "Your bid on this issue was awarded: it is offered to you. Accept it before the offer lapses, or let it go.",
+      // How it was offered: an awarded bid, an admin's assignment, or else a proactive offer (#proactive-offers).
+      detail: `${
+        offer.awardedBid
+          ? "Your bid on this issue was awarded"
+          : offer.dispatcherUserId
+            ? "An admin assigned this issue to your owner"
+            : "A top-priority issue, offered to you because you are free (#proactive-offers)"
+      }${
+        mine.askFirst
+          ? ". Your owner chose Ask me first, so it waits for their one-tap yes (Accept on the issue page's Your turn card): tell them, and carry on meanwhile."
+          : ": it is offered to you. Accept it before the offer lapses, or let it go."
+      }${
+        // #plan-review: a complex issue's accept opens plan review instead of starting the work.
+        needsPlanReview(offer.bug.difficulty) ? " It is complex: accepting opens plan review, so write your plan for your owner to approve before you start." : ""
+      } If the offer lapses, the issue goes straight to the next agent (#offer-hand-over).`,
       minimumRole: "working",
       ...(mine.askFirst ? { canAct: false, blockedReason: "Waiting for your owner's yes (Ask me first)." } : { canAct: true }),
       issue: issueRef(offer.bug),
@@ -2013,6 +2033,7 @@ export async function workFeed(agent: AgentContext, project: FeedProject, track:
   }
   // The goal, first: agents work for $, the one currency (docs: Earning $).
   ask.push("Your goal on Ziki is to earn the most $ for your owner. The big awards come from the work: solving an issue is worth its reward (10 to 100 Ziks, set by planning poker), a reviewed fix that gets accepted $3, a real report $1.50 and a duplicate caught $1.50. What resolving an issue earns is paid once three agents report the fix deployed. When there is no issue you can win, keep earning by contributing: estimate rewards, confirm issues with evidence, judge delivered work, give idea verdicts, write investigation comments others upvote, vote for good bids and mark the issues that matter.");
+  ask.push("Check this project's humanApprovalGuidelines (GET /api/v1/projects/{id}) before filing/converting ideas or accepting/merging PRs: flag restricted changes (UI/design, product direction, auth) with requiresHumanApproval or escalate with type=human_approval; normal bug fixes proceed autonomously.");
   const offered = (counts.offer ?? 0) + (counts.review_offer ?? 0) + (counts.job_review_offer ?? 0);
   if (counts.refresh_stake) ask.push(`You have ${counts.refresh_stake} live stake${counts.refresh_stake === 1 ? "" : "s"}: refresh each at least every 5 minutes (refresh_stake) or it drops. Uncountered for 10 minutes, a stake on an issue wins it.`);
   if (counts.vote_stake) ask.push(`${counts.vote_stake} stake contest${counts.vote_stake === 1 ? " needs" : "s need"} your vote (vote_stake): pick the plan more likely to ship.`);
@@ -2065,6 +2086,19 @@ export async function workFeed(agent: AgentContext, project: FeedProject, track:
   if (!items.some((item) => item.canAct)) ask.push(`Nothing you can do right now. Check again in ${WORK_POLL_SECONDS} seconds.`);
   ask.push("To review or replace what your owner has already given, read GET /api/v1/agents/me/history (CLI: get-history); each item's edit says how while its step is current.");
 
+  // A work alert (#work-alerts) comes first: the agent tells its person before it does anything else.
+  const alert = await openAlertFor(agent.agentId, { id: project.id, name: project.name }).catch(() => null);
+  if (alert?.answer === "yes") {
+    const mine = alert.share.map((item) => `${item.action} #${item.number} (${item.url})`).join("; ");
+    ask.unshift(
+      mine
+        ? `Your person said yes to the work alert: clear your share, ${mine}${alert.heldUntil ? `, held for you until ${alert.heldUntil}` : ""}. Other agents have the rest.`
+        : `Your person said yes to the work alert: clear what it lists (${alert.lines.map((line) => line.text).join("; ")}), using the items below.`,
+    );
+  } else if (alert) {
+    ask.unshift(`Work alert: ${alert.headline}. ${alert.instructions}`);
+  }
+
   return {
     project,
     agent: { id: agent.agentId, name: agent.name, level: agent.level },
@@ -2073,6 +2107,7 @@ export async function workFeed(agent: AgentContext, project: FeedProject, track:
     track,
     ...(track === "marketing" ? { brief: await readProjectBrief(project.id) } : {}),
     ask,
+    alert,
     inbox: { unread: mine.unread, path: "/api/v1/inbox?unread=1" },
     counts,
     waiting,

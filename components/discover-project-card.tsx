@@ -9,8 +9,7 @@ import { joinOpenProjectAction } from "@/app/actions/project-join-requests";
 import { ProjectJoinRequestButton } from "@/components/project-join-request-button";
 import { formatZ, REPORTER_POINTS, REVIEWER_POINTS } from "@/lib/points/rules";
 import type { ProjectRewardConfig } from "@/lib/points/project-rewards";
-import { projectPath, projectRef } from "@/lib/project-paths";
-import { publicContributePath } from "@/lib/public-project-paths";
+import { issuesPath, projectRef } from "@/lib/project-paths";
 
 export type DiscoverableProject = {
   id: string;
@@ -40,7 +39,6 @@ export function DiscoverProjectCard({ project }: { project: DiscoverableProject 
   const router = useRouter();
   const [joining, startJoining] = useTransition();
   const [joinError, setJoinError] = useState<string | null>(null);
-  const publicRef = { orgSlug: project.organisation.slug, projectSlug: project.slug };
   const reporterReward = project.rewardConfig?.reporter ?? REPORTER_POINTS;
   const reviewerReward = project.rewardConfig?.reviewer ?? REVIEWER_POINTS;
   const earningGuidelines = project.rewardConfig?.guidelines ?? null;
@@ -64,7 +62,7 @@ export function DiscoverProjectCard({ project }: { project: DiscoverableProject 
               </span>
               <h3 className="text-lg font-bold text-zk-text">
                 <Link
-                  href={projectPath(projectRef(project.organisation.slug, project.slug))}
+                  href={issuesPath(projectRef(project.organisation.slug, project.slug), "your_work")}
                   className="hover:text-zk-accent hover:underline"
                 >
                   {project.name}
@@ -72,15 +70,6 @@ export function DiscoverProjectCard({ project }: { project: DiscoverableProject 
               </h3>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-1.5">
-              <Badge
-                className={
-                  project.acceptsGuestIdeas
-                    ? "shrink-0 rounded-full border border-sky-500/30 bg-sky-500/10 text-[11px] font-semibold text-sky-400"
-                    : "shrink-0 rounded-full border border-zk-border bg-zk-chip text-[11px] font-medium text-zk-muted"
-                }
-              >
-                {project.acceptsGuestIdeas ? "Accepts feedback" : "Feedback closed"}
-              </Badge>
               {project.isOpenForContributors ? (
                 <Badge className="shrink-0 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-[11px] font-semibold text-emerald-400">
                   Open for Contributors
@@ -200,16 +189,9 @@ export function DiscoverProjectCard({ project }: { project: DiscoverableProject 
           </div>
 
           <div className="flex flex-wrap items-center justify-end gap-2">
-            {project.acceptsGuestIdeas ? (
-              <Link href={publicContributePath(publicRef)}>
-                <Button variant="secondary" className="text-xs font-semibold">
-                  Report issue
-                </Button>
-              </Link>
-            ) : null}
             {currentStatus === "guest" ? (
               project.isOpenForContributors ? (
-                <Link href={`/login?callbackUrl=${encodeURIComponent(projectPath(projectRef(project.organisation.slug, project.slug)))}`}>
+                <Link href={`/login?callbackUrl=${encodeURIComponent(issuesPath(projectRef(project.organisation.slug, project.slug), "your_work"))}`}>
                   <Button
                     variant="primary"
                     className="text-xs font-semibold"
@@ -218,14 +200,14 @@ export function DiscoverProjectCard({ project }: { project: DiscoverableProject 
                   </Button>
                 </Link>
               ) : (
-                <Link href={`/login?callbackUrl=${encodeURIComponent(projectPath(projectRef(project.organisation.slug, project.slug)))}`}>
+                <Link href={`/login?callbackUrl=${encodeURIComponent(issuesPath(projectRef(project.organisation.slug, project.slug), "your_work"))}`}>
                   <Button variant="secondary" className="text-xs font-semibold">
                     Sign in to ask to join
                   </Button>
                 </Link>
               )
             ) : currentStatus === "member" ? (
-              <Link href={projectPath(projectRef(project.organisation.slug, project.slug))}>
+              <Link href={issuesPath(projectRef(project.organisation.slug, project.slug), "your_work")}>
                 <Button variant="secondary" className="text-xs font-medium">
                   Open Project →
                 </Button>

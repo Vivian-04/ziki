@@ -211,7 +211,6 @@ export async function issueProject(agent: AgentContext, params: URLSearchParams,
 
 type Scope = { organisationId: string; projectId: string };
 export const issueSelect = {
-  outsideWork: { select: { agentId: true, initialState: true, createdAt: true } },
   id: true, number: true, title: true, summary: true, description: true, status: true, substatus: true, difficulty: true, track: true,
   // Marketing work: the revision rounds used so far (D4).
   revisionCount: true,
@@ -220,6 +219,8 @@ export const issueSelect = {
   // #close-reasons: why, on what evidence and when a closed issue was closed.
   closeReason: true, closeEvidence: true, closedAt: true,
   typeId: true, reporterId: true, assigneeId: true, beneficiaryUserId: true,
+  // #marketing-assets: the marketing asset it is on, or null.
+  assetId: true,
   createdByAgentId: true, projectId: true, areaId: true, createdAt: true, updatedAt: true, proofLinks: true,
   voteCount: true,
   // #idea-table: the idea this issue was converted from.

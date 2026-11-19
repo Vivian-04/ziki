@@ -9,11 +9,6 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 const mocks = vi.hoisted(() => ({ addComment: vi.fn(), requestRetest: vi.fn(), editPullRequestUrl: vi.fn(), switchWorkspace: vi.fn(), takeItBack: vi.fn() }));
 vi.mock("@/app/(app)/organisations/issue-switch-action", () => ({ switchIssueWorkspaceAction: mocks.switchWorkspace }));
 vi.mock("@/app/actions/take-it-back", () => ({ takeItBackAction: mocks.takeItBack }));
-const libraryRefresh = vi.hoisted(() => vi.fn());
-const importActions = vi.hoisted(() => ({ importWork: vi.fn(), request: vi.fn(), grant: vi.fn() }));
-vi.mock("@/app/actions/import-outside-work", () => ({ importOutsideWorkAction: importActions.importWork }));
-vi.mock("@/app/actions/express-imports", () => ({ requestExpressImportAction: importActions.request, setExpressImportAction: importActions.grant }));
-vi.mock("@/app/(app)/[org]/[project]/marketing/output-box/actions", () => ({ refreshLibrary: libraryRefresh }));
 vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(window.location.search),
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn(), replace: vi.fn() }),
@@ -44,69 +39,16 @@ import { IssueLinks } from "@/components/issue-links";
 import { CopyIssueSummaryButton } from "@/components/copy-issue-summary-button";
 import { formatIssueSummary } from "@/lib/issue-share-summary";
 import { ToastProvider } from "@/components/ui/toast";
-import { Library } from "@/components/marketing/library/library";
-import { deliveryFiles, filterLibrary, type LibraryItem } from "@/components/marketing/library/model";
 import { MarketingTaskHeader } from "@/components/marketing/marketing-task-header";
 import { MarketingDeliverablesPanel, type MarketingDeliveryView } from "@/components/marketing/marketing-deliverables-panel";
 import { MarketingTaskDetail } from "@/components/marketing/marketing-task-detail";
 import { projectRef } from "@/lib/project-paths";
 import { DecisionCard } from "@/components/decision-card";
-import { IssueProgressReport } from "@/components/issue-progress-report";
-import { outsideWorkSkippedStages } from "@/lib/outside-work";
-import { OutsideWorkForm, ExpressImportRequestQueue } from "@/components/outside-work-form";
 import { decisionFor, type DecisionIssue, type DecisionSuggestion } from "@/lib/your-decision";
 import { designDecisionsFor } from "@/lib/design-view";
 import { DesignDecisionButtons } from "@/components/design-decision-buttons";
 
 const PR = "https://github.com/emerjent/ziki/pull/42";
-
-describe("outside-work import form and access requests (#788)", () => {
-  afterEach(cleanup);
-  const agent = { id: "agent-1", name: "SERGE", enabled: false, request: null };
-  it("explains approval before import and displays a declined import's error", async () => {
-    importActions.importWork.mockResolvedValue({ ok: false, error: "An organisation owner or admin must grant this agent express import access to this project." });
-    render(<OutsideWorkForm projectId="p1" agents={[agent]} />);
-    expect(screen.getByLabelText("Import requirements")).toHaveTextContent("Imports without approval are declined");
-    for (const [label, value] of [["Title", "Delivered search"], ["Summary", "Search now works."], ["Description", "Implemented and verified search."], ["GitHub pull request", PR], ["Tests run and results", "pnpm test passed."]]) fireEvent.change(screen.getByLabelText(label), { target: { value } });
-    fireEvent.submit(screen.getByRole("button", { name: "Import delivered work" }).closest("form")!);
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("must grant this agent express import access"));
-    expect(importActions.importWork).toHaveBeenCalledWith("agent-1", "p1", expect.objectContaining({ title: "Delivered search", pullRequestUrl: PR, testResults: "pnpm test passed." }), expect.any(String));
-  });
-  it("lets an owner request approval without offering a self-grant control", async () => {
-    importActions.request.mockResolvedValue({ ok: true });
-    render(<OutsideWorkForm projectId="p1" agents={[agent]} />);
-    expect(screen.queryByRole("button", { name: "Approve access" })).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Why does this agent need express imports?"), { target: { value: "Owner-directed delivered work." } });
-    fireEvent.submit(screen.getByRole("button", { name: "Request admin approval" }).closest("form")!);
-    await waitFor(() => expect(importActions.request).toHaveBeenCalledWith("agent-1", "p1", "Owner-directed delivered work."));
-    expect(await screen.findByRole("status")).toHaveTextContent("Access requested");
-  });
-  it("shows a declined request's admin response and permits a revised request", () => {
-    render(<OutsideWorkForm projectId="p1" agents={[{ ...agent, request: { decision: "declined", response: "Provide the PR evidence first." } }]} />);
-    expect(screen.getByText(/Provide the PR evidence first/)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Request admin approval" })).toBeEnabled();
-  });
-  it("shows the requesting agent and reason in the admin queue", () => {
-    render(<ExpressImportRequestQueue projectId="p1" requests={[{ agentId: "agent-1", name: "SERGE", username: "serge", owner: "Developer", reason: "Owner-directed delivered work." }]} />);
-    expect(screen.getByText("Owner-directed delivered work.")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Approve access" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Decline request" })).toBeVisible();
-  });
-});
-
-describe("outside-board progress provenance (#788)", () => {
-  afterEach(cleanup);
-  it("shows omitted pre-merge steps for merged imports instead of positive verdict totals", () => {
-    render(<IssueProgressReport decisions={[]} currentStage="live" skippedStages={outsideWorkSkippedStages("merged")} />);
-    expect(screen.getByRole("button", { name: /Requires review.*Skipped: PR already merged/ })).toBeVisible();
-    expect(screen.queryByText("0 judgements")).not.toBeInTheDocument();
-  });
-  it("retains real judging for open imports", () => {
-    render(<IssueProgressReport decisions={[]} currentStage="delivered" entryCounts={{ delivered: 2 }} skippedStages={outsideWorkSkippedStages("open")} />);
-    expect(screen.getByRole("button", { name: /Requires review.*2 judgements/ })).toBeVisible();
-    expect(outsideWorkSkippedStages("open").delivered).toBeUndefined();
-  });
-});
 
 const verdict: TestVerdictView = {
   id: "tv1",
@@ -157,100 +99,6 @@ describe("shared issue workspace switch", () => {
     await user.click(button);
     await waitFor(() => expect(mocks.switchWorkspace).toHaveBeenCalledTimes(2));
     window.history.replaceState(null, "", "/");
-  });
-});
-
-describe("Library approved deliverables", () => {
-  const items: LibraryItem[] = [
-    { id: "launch", number: 42, title: "Launch campaign", summary: "Approved campaign", agent: "Studio", publishedAt: "2026-11-04T12:00:00Z", files: deliveryFiles(["https://example.com/social.png", "https://example.com/guide.docx"]) },
-    { id: "article", number: 38, title: "Agent workflow", summary: "A workflow guide", agent: "Writer", publishedAt: "2026-11-02T12:00:00Z", files: deliveryFiles(["https://example.com/blog/workflow"]) },
-  ];
-  beforeEach(() => {
-    window.history.replaceState(null, "", "/demo/marketing/library");
-    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false })));
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-    window.history.replaceState(null, "", "/");
-  });
-
-  it("combines attachment type and search, sorts by publication, and refuses unsafe sources", () => {
-    expect(filterLibrary(items, "guide.docx", "Docs", false).map((item) => item.id)).toEqual(["launch"]);
-    expect(filterLibrary(items, "#38", "Articles", false).map((item) => item.id)).toEqual(["article"]);
-    expect(filterLibrary(items, "Studio", "Videos", false)).toEqual([]);
-    expect(filterLibrary(items, "", "All", true).map((item) => item.id)).toEqual(["article", "launch"]);
-    const written = [{ ...items[0], id: "written", files: deliveryFiles([], [], "# The launch essay") }];
-    expect(filterLibrary(written, "launch essay", "Articles", false).map((item) => item.id)).toEqual(["written"]);
-    expect(deliveryFiles(["javascript:alert(1)", "data:text/html,bad", "https://user:password@example.com/file", "/api/attachments/unrelated"])).toEqual([]);
-    expect(deliveryFiles(["/api/attachments/owned"], [{ id: "owned", filename: "graphic.png", contentType: "image/png", size: 20 }])).toEqual([expect.objectContaining({ name: "graphic.png", local: true, kind: "Graphics" })]);
-  });
-
-  it("switches attachments and updates actions without changing the associated task", async () => {
-    const user = userEvent.setup();
-    const view = render(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    await user.click(screen.getByRole("button", { name: "guide.docx" }));
-    view.rerender(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    expect(screen.getByRole("link", { name: /Open original/ })).toHaveAttribute("href", "https://example.com/guide.docx");
-    expect(screen.getByRole("link", { name: /View task #42/ })).toHaveAttribute("href", "/acme/demo/42");
-    expect(screen.getByRole("button", { name: /Download/ })).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: /Agent workflow.*Task #38/ }));
-    view.rerender(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    expect(screen.getByRole("link", { name: /Open original/ })).toHaveAttribute("href", "https://example.com/blog/workflow");
-    expect(screen.queryByRole("button", { name: /Download/ })).not.toBeInTheDocument();
-  });
-
-  it("keeps everything typed in search while the URL catches up", async () => {
-    const user = userEvent.setup();
-    render(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    const search = screen.getByRole("searchbox", { name: "Search approved work" });
-    await user.type(search, "workflow");
-    expect(search).toHaveValue("workflow");
-    expect(new URLSearchParams(window.location.search).get("q")).toBe("workflow");
-    expect(screen.queryByRole("button", { name: /Launch campaign.*Task #42/ })).not.toBeInTheDocument();
-  });
-
-  it("retries only a failed preview and keeps task access available", async () => {
-    const user = userEvent.setup();
-    render(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    fireEvent.error(screen.getByRole("img", { name: /Launch campaign/ }));
-    await user.click(screen.getByRole("button", { name: "Retry preview" }));
-    expect(screen.getByRole("img", { name: /Launch campaign/ })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /View task #42/ })).toHaveAttribute("href", "/acme/demo/42");
-    expect(libraryRefresh).not.toHaveBeenCalled();
-  });
-
-  it("retains results on refresh failure and recovers from an initial collection error", async () => {
-    const user = userEvent.setup();
-    libraryRefresh.mockResolvedValue({ ok: false });
-    const view = render(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(/previous results/);
-    expect(screen.getByRole("link", { name: /View task #42/ })).toBeInTheDocument();
-    view.unmount();
-    libraryRefresh.mockResolvedValue({ ok: true, items });
-    render(<Library slug={projectRef("acme", "demo")} initial={{ ok: false }} />);
-    await user.click(screen.getByRole("button", { name: "Try again" }));
-    expect(await screen.findByRole("link", { name: /View task #42/ })).toBeInTheDocument();
-  });
-
-  it("keeps mobile selection and search in the URL when returning from the detail view", async () => {
-    window.history.replaceState(null, "", "/demo/marketing/library?q=Studio");
-    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: true })));
-    const scroll = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
-    const user = userEvent.setup();
-    const view = render(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    await user.click(screen.getByRole("button", { name: /Launch campaign.*Task #42/ }));
-    view.rerender(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    expect(new URLSearchParams(window.location.search).get("view")).toBe("detail");
-    expect(screen.getByRole("heading", { name: "Launch campaign" })).toHaveFocus();
-    await user.click(screen.getByRole("button", { name: /Back to Library/ }));
-    view.rerender(<Library slug={projectRef("acme", "demo")} initial={{ ok: true, items }} />);
-    expect(new URLSearchParams(window.location.search).get("q")).toBe("Studio");
-    expect(new URLSearchParams(window.location.search).get("item")).toBe("launch");
-    expect(new URLSearchParams(window.location.search).has("view")).toBe(false);
-    expect(screen.getByRole("button", { name: /Launch campaign.*Task #42/ })).toHaveAttribute("aria-pressed", "true");
-    scroll.mockRestore();
   });
 });
 

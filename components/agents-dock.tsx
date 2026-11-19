@@ -6,7 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { agentEditHref, agentPageHref, LEADERBOARD_HREF } from "@/lib/header-nav";
 import { AGENTS_DOCK_HEIGHT, dockVisibleOn, leaderboardVisible } from "@/lib/agents-dock";
 import { PAGE_CONTAINER_CLASS } from "@/components/page-container";
-import { projectPath, type ProjectRef } from "@/lib/project-paths";
+import { orgRefOf, projectPath, queuePath, type ProjectRef } from "@/lib/project-paths";
 import { useProjectRef } from "@/lib/use-project-ref";
 import { formatZ } from "@/lib/points/rules";
 import { updateMood } from "@/components/agent-robots/moods";
@@ -19,7 +19,6 @@ import { basePose, type Effects, type Runtime, walkTo, wander } from "@/componen
 import { drawDesk, drawRipples, drawStuckDesk, type Ripple } from "@/components/agent-robots/props";
 import { drawFront, drawSide, type Pose } from "@/components/agent-robots/robot";
 import { type AgentState, type Palette, metalFor } from "@/components/agent-robots/types";
-import type { DockCluster } from "@/lib/clusters";
 
 export type DockAgent = {
   id: string;
@@ -95,8 +94,6 @@ const LOW_FLOOR_H = 74;
 /** A face, avatar or plain light: its size and how far its foot is from the floor, so it sits in the strip's middle. */
 const FIGURE = 30;
 const FIGURE_LIFT = (LOW_FLOOR_H - FIGURE) / 2;
-/** How long the agents stay opened up after the cursor leaves the strip. */
-const LABELS_LINGER = 350;
 /** Until a nameplate has measured itself: its name and status, and with what it has earned. */
 const GUESS = { text: 110, full: 180 };
 
@@ -125,17 +122,17 @@ const RANK: Record<DockAgent["status"], number> = { waiting: 0, stuck: 1, workin
  */
 export function AgentsDock({
   agents: given,
-  clusters = [],
   defaultProjectSlug = null,
   memberCount = null,
+  showActiveAgents = true,
 }: {
   agents: DockAgent[];
-  /** Clusters the person's agents are in (#agent-clusters), listed like group chats. */
-  clusters?: DockCluster[];
   /** Workstream's project on pages outside a project. */
   defaultProjectSlug?: ProjectRef | null;
   /** Members of the current organisation: the leaderboard link is left out when it is just you. Null when unknown. */
   memberCount?: number | null;
+  /** False when the person hid the Active agents page (#active-agents): its link is left out. */
+  showActiveAgents?: boolean;
 }) {
   const prefs = useDockPrefs();
   // Workstream (#workstream), in the Agents menu: this page's project, else the person's default.
@@ -164,18 +161,15 @@ export function AgentsDock({
   const measurePlate = (id: string, text: number, full: number) =>
     setPlates((all) => (all[id]?.text === text && all[id]?.full === full ? all : { ...all, [id]: { text, full } }));
   const [hover, setHover] = useState<string | null>(null);
-  // Closed until the cursor comes to the strip: then every agent opens up together, and closes again when it leaves.
-  const [hovering, setLabels] = useState(false);
-  const labels = hovering;
+  // The nameplates stay as they are: hovering the strip doesn't open them up.
+  const labels = false;
   // Another page opens with the agents closed up again, even if the cursor left the strip by clicking through it.
   const [page, setPage] = useState(pathname);
   if (page !== pathname) {
     setPage(pathname);
-    setLabels(false);
     setHover(null);
   }
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const labelTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const canvas = useRef<HTMLCanvasElement>(null);
   const runtimes = useRef(new Map<string, Bot>());
   const view = useRef<FloorMode>(null); // which floor the robots were last placed on
@@ -328,7 +322,6 @@ export function AgentsDock({
   useEffect(() => {
     return () => {
       clearTimeout(timer.current);
-      clearTimeout(labelTimer.current);
     };
   }, []);
 
@@ -360,15 +353,6 @@ export function AgentsDock({
   // The leaderboard is in the Agents menu; nobody to rank against in an organisation of one.
   const leaderboard = leaderboardVisible(memberCount);
 
-  const showLabels = () => {
-    clearTimeout(labelTimer.current);
-    setLabels(true);
-  };
-  const fadeLabels = () => {
-    clearTimeout(labelTimer.current);
-    labelTimer.current = setTimeout(() => setLabels(false), LABELS_LINGER);
-  };
-
   const close = () => {
     clearTimeout(timer.current);
     setHover(null);
@@ -398,10 +382,6 @@ export function AgentsDock({
     <div
       className="pointer-events-auto relative"
       style={{ height: floorHeight }}
-      onMouseEnter={showLabels}
-      onMouseLeave={fadeLabels}
-      onFocus={showLabels}
-      onBlur={fadeLabels}
     >
       {pixelOnFloor ? (
         <canvas ref={canvas} height={CANVAS_H} aria-hidden="true" className="absolute inset-0" style={{ width: "100%", height: floorHeight }} />
@@ -439,6 +419,20 @@ export function AgentsDock({
           </li>
         ))}
       </ul>
+      {/* The work queue (#work-queue), just after the last agent: the same tickets as the lists, laid out for working through them. */}
+      {workstreamRef && agents.length ? (
+        <Link
+          href={queuePath(orgRefOf(workstreamRef))}
+          aria-label="Open the work queue"
+          title="Work queue"
+          className="absolute flex h-8 w-8 items-center justify-center rounded-full border border-zk-border bg-zk-surface text-zk-text2 shadow-sm transition hover:bg-zk-chip hover:text-zk-text focus-visible:outline-2 focus-visible:outline-electric-blue"
+          style={{ left: first + total + 16, top: "50%", transform: "translateY(-50%)" }}
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="m9 18 6-6-6-6" />
+          </svg>
+        </Link>
+      ) : null}
     </div>
   ) : null;
 
@@ -554,7 +548,17 @@ export function AgentsDock({
                 </ul>
               </div>
             ) : null}
-            <ClusterGroups clusters={clusters} allHref={workstreamRef ? projectPath(workstreamRef, "/clusters") : null} onDone={() => setPanel(false)} />
+            {workstreamRef ? (
+              // Agent clusters (#agent-clusters): one link to the project's clusters.
+              <Link
+                href={projectPath(workstreamRef, "/clusters")}
+                onClick={() => setPanel(false)}
+                className="mt-2 flex items-center justify-between rounded-lg px-1.5 py-1.5 text-xs font-bold text-zk-text2 transition hover:bg-zk-chip focus-visible:outline-2 focus-visible:outline-electric-blue"
+              >
+                All agent clusters
+                <span aria-hidden="true">→</span>
+              </Link>
+            ) : null}
             {workstreamRef ? (
               <Link
                 href={projectPath(workstreamRef, "/workstream")}
@@ -562,6 +566,17 @@ export function AgentsDock({
                 className="mt-2 flex items-center justify-between rounded-lg px-1.5 py-1.5 text-xs font-bold text-zk-text2 transition hover:bg-zk-chip focus-visible:outline-2 focus-visible:outline-electric-blue"
               >
                 Workstream
+                <span aria-hidden="true">→</span>
+              </Link>
+            ) : null}
+            {/* Active agents (#active-agents): who is at work in the project, their bids and awards, and who is stuck. */}
+            {workstreamRef && showActiveAgents ? (
+              <Link
+                href={projectPath(workstreamRef, "/agents")}
+                onClick={() => setPanel(false)}
+                className="mt-2 flex items-center justify-between rounded-lg px-1.5 py-1.5 text-xs font-bold text-zk-text2 transition hover:bg-zk-chip focus-visible:outline-2 focus-visible:outline-electric-blue"
+              >
+                Active agents
                 <span aria-hidden="true">→</span>
               </Link>
             ) : null}
@@ -1112,67 +1127,4 @@ function isLightTheme(): boolean {
   const pinned = document.documentElement.dataset.theme;
   if (pinned) return pinned === "light";
   return !window.matchMedia("(prefers-color-scheme: dark)").matches;
-}
-
-/** "2h", "3d": how long since a cluster was last active, as a chat list shows it. */
-function sinceShort(iso: string): string {
-  const minutes = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
-  if (minutes < 60) return `${Math.max(1, minutes)}m`;
-  const hours = Math.round(minutes / 60);
-  return hours < 24 ? `${hours}h` : `${Math.round(hours / 24)}d`;
-}
-
-/**
- * Clusters (#agent-clusters) in the Agents panel, like group chats: the groups your
- * agents are in, where they go for what another agent knows. Newest activity first,
- * each with its latest task; "All clusters" opens the project's list.
- */
-function ClusterGroups({ clusters, allHref, onDone }: { clusters: DockCluster[]; allHref: string | null; onDone: () => void }) {
-  if (!clusters.length && !allHref) return null;
-  return (
-    <div className="mt-2">
-      <p className="m-0 flex items-center justify-between px-1.5 pb-1 text-[11px] font-semibold text-zk-muted">
-        <span>Agent Clusters</span>
-        {clusters.length ? <span>{clusters.length}</span> : null}
-      </p>
-      {clusters.length ? (
-        <ul className="m-0 list-none space-y-1 p-0">
-          {clusters.map((cluster) => (
-            <li key={cluster.id}>
-              <Link
-                href={cluster.href}
-                onClick={onDone}
-                className="flex items-center gap-2 rounded-lg px-1.5 py-1.5 text-xs transition hover:bg-zk-chip focus-visible:outline-2 focus-visible:outline-electric-blue"
-              >
-                <span aria-hidden="true" className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-zk-tint text-[11px] font-bold text-zk-accent">
-                  {cluster.name.split(/\s+/).map((word) => word[0]).join("").slice(0, 2).toUpperCase()}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-baseline justify-between gap-2">
-                    <span className="truncate font-semibold text-zk-text">{cluster.name}</span>
-                    <span className="shrink-0 text-[11px] text-zk-muted">{sinceShort(cluster.lastActivityAt)}</span>
-                  </span>
-                  <span className="block truncate text-zk-muted">
-                    {cluster.lastTask ?? "No tasks yet"} · {cluster.members} {cluster.members === 1 ? "member" : "members"}
-                  </span>
-                </span>
-              </Link>
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="m-0 px-1.5 pb-1 text-xs text-zk-muted">Your agents aren&apos;t in a cluster yet.</p>
-      )}
-      {allHref ? (
-        <Link
-          href={allHref}
-          onClick={onDone}
-          className="mt-1 flex items-center justify-between rounded-lg px-1.5 py-1.5 text-xs font-bold text-zk-text2 transition hover:bg-zk-chip focus-visible:outline-2 focus-visible:outline-electric-blue"
-        >
-          All agent clusters
-          <span aria-hidden="true">→</span>
-        </Link>
-      ) : null}
-    </div>
-  );
 }
