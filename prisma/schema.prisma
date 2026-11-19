@@ -1009,6 +1009,7 @@ model Project {
   workflow                ProjectWorkflow?
   previewSettings         ProjectPreviewSettings?
   previewBuilds           PreviewBuild[]
+  projectPreviewBuilds    ProjectPreviewBuild[]
   mistakes                AgentMistake[]
   notes                   ProjectNotes?
   brief                   ProjectBrief?
@@ -1096,21 +1097,23 @@ model ProjectWorkflow {
 /// Cloudflare Pages account. Off until an owner or admin turns it on, because
 /// previews are public links. No row means the defaults below.
 model ProjectPreviewSettings {
-  projectId      String   @id
-  enabled        Boolean  @default(false)
+  projectId      String    @id
+  enabled        Boolean   @default(false)
   /// The folder to build in, relative to the repository root.
-  rootDir        String   @default(".")
+  rootDir        String    @default(".")
   /// Null: detected from the lock file.
   installCommand String?
-  buildCommand   String   @default("npm run build")
+  buildCommand   String    @default("npm run build")
   /// The build's output folder, relative to rootDir.
-  outputDir      String   @default("dist")
-  nodeVersion    String   @default("22")
+  outputDir      String    @default("dist")
+  nodeVersion    String    @default("22")
   /// Name to value, set while building. Public: built into the frontend code.
-  buildVariables Json     @default("{}")
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  buildVariables Json      @default("{}")
+  /// When Ziki last checked the main branch for a new commit to preview.
+  mainCheckedAt  DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  project        Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
 }
 
 /// One preview build of a pull request commit (#previews): Ziki started the
@@ -1141,6 +1144,37 @@ model PreviewBuild {
 
   @@unique([bugId, headSha])
   @@index([status, updatedAt])
+}
+
+/// One preview build of a project's main branch (#project-previews): a project
+/// with previews on keeps one live preview of its latest main commit. Ziki
+/// starts the preview builder for each new commit and follows the run. One per
+/// project and commit, so seeing the same commit again starts nothing.
+model ProjectPreviewBuild {
+  id          String    @id @default(cuid())
+  projectId   String
+  /// The project's main repository, owner/name.
+  repository  String
+  /// The branch that was built: the repository's default branch.
+  branch      String
+  headSha     String
+  /// queued (dispatched, no run seen yet), building, ready or failed.
+  status      String    @default("queued")
+  /// The builder's workflow run, once known.
+  runId       String?
+  runUrl      String?
+  /// The project's preview address, once ready.
+  url         String?
+  /// Why it failed, in a sentence.
+  error       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, headSha])
+  @@index([status, updatedAt])
+  @@index([projectId, createdAt])
 }
 
 /// A project-owned work area, such as frontend or backend (#609).
