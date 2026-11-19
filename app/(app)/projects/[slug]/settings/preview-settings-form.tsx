@@ -59,9 +59,9 @@ export function PreviewSettingsForm({
 
       <div className="flex items-start justify-between gap-4">
         <span className="text-sm text-zk-text">
-          <span id="preview-enabled-label" className="font-medium">Build previews of pull requests</span>
+          <span id="preview-enabled-label" className="font-medium">Build previews</span>
           <span id="preview-enabled-hint" className="block text-xs font-normal text-zk-muted">
-            {repoUrl ? `For the main repository, ${repoUrl}. ` : "The project has no main repository yet. "}
+            {repoUrl ? `Of the main branch and the pull requests of ${repoUrl}. ` : "The project has no main repository yet. "}
             Previews are public links: anyone with a link can open one, including for a private repository.
           </span>
           {fieldErrors?.enabled ? <span className="block text-xs text-zk-bad-fg">{fieldErrors.enabled}</span> : null}

@@ -18,6 +18,8 @@ import { ProjectRepositoriesManager } from "./repositories-manager";
 import { RepositoryAccessPanel } from "./repository-access";
 import { repositoryAccessForSettings } from "@/lib/github/settings-access";
 import { PreviewSettingsForm } from "./preview-settings-form";
+import { ProjectPreviewCard } from "@/components/project-preview-card";
+import { latestProjectPreview } from "@/lib/previews/project-builds";
 import { ProjectGoals } from "@/app/(app)/[org]/[project]/goals/project-goals";
 import { CopyProjectIdButton } from "@/app/(app)/projects/copy-project-id";
 import { ConfirmSubmitButton } from "@/components/confirm-submit-button";
@@ -49,7 +51,7 @@ const SECTIONS = [
   {
     id: "previews",
     label: "Previews",
-    hint: "Pull request preview builds",
+    hint: "Main branch and pull request previews",
     icon: "M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
   },
   {
@@ -158,6 +160,7 @@ export default async function ProjectSettingsPage({
   const previewSettings = section === "previews"
     ? previewSettingsValues(await prisma.projectPreviewSettings.findUnique({ where: { projectId: project.id } }))
     : null;
+  const projectPreview = section === "previews" ? await latestProjectPreview(project.id) : null;
   const platformDefaults = section === "details" ? projectDefaultsFromPlatform(await getPlatformRewardConfig(prisma)) : null;
   const base = `/projects/${encodeURIComponent(project.slug)}/settings`;
 
@@ -261,8 +264,9 @@ export default async function ProjectSettingsPage({
               <div className="flex flex-col gap-1">
                 <h2 id="previews-heading" className="m-0 text-lg font-bold text-zk-text">Previews</h2>
                 <span className="text-[13px] text-zk-muted">
-                  Ziki builds each pull request of the main repository and links a working preview from its issue. For frontends
-                  that build to static files. Changes are audited.
+                  Ziki keeps a live preview of the main branch at one fixed link, rebuilt after each merge, and builds each pull
+                  request of the main repository with a preview linked from its issue. For frontends that build to static files.
+                  Changes are audited.
                 </span>
               </div>
               {!project.githubInstallationId ? (
@@ -273,6 +277,14 @@ export default async function ProjectSettingsPage({
                   </Link>
                   .
                 </p>
+              ) : null}
+              {projectPreview ? (
+                <ProjectPreviewCard
+                  slug={project.slug}
+                  build={projectPreview.build}
+                  lastReadyUrl={projectPreview.lastReadyUrl}
+                  enabled={previewSettings.enabled}
+                />
               ) : null}
               <PreviewSettingsForm slug={project.slug} settings={previewSettings} repoUrl={project.repoUrl} />
             </section>

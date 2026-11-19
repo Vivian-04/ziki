@@ -15,6 +15,7 @@ import { sweepUndraftedIdeas } from "@/lib/cron/draft-structuring";
 import { processSearchOutbox, pruneProcessedSearchOutbox } from "@/lib/search-index";
 import { refreshMergeQueue } from "@/lib/github/sync";
 import { followPreviewBuilds } from "@/lib/previews/builds";
+import { followProjectPreviewBuilds, sweepProjectPreviews } from "@/lib/previews/project-builds";
 import { sweepSecurityChecks } from "@/lib/security-checks/engine";
 import { retryPendingWithdrawals } from "@/lib/coins/withdraw";
 import { sweepFallback } from "@/lib/security-checks/fallback";
@@ -87,6 +88,7 @@ export type PlatformSweepsResult = {
     };
     githubStatus: { status: "ok" | "error"; checked?: number; moved?: number; failed?: number; error?: string };
     previews: { status: "ok" | "error"; checked?: number; failed?: number; error?: string };
+    projectPreviews: { status: "ok" | "error"; checked?: number; started?: number; followed?: number; failed?: number; error?: string };
     withdrawals: { status: "ok" | "error"; checked?: number; sent?: number; waiting?: number; returned?: number; error?: string };
     deliveries: { status: "ok" | "error"; processed?: number; error?: string };
     retention: {
@@ -139,6 +141,7 @@ export async function runPlatformSweeps(): Promise<PlatformSweepsResult | { skip
         draftStructuring: { status: "ok" },
         githubStatus: { status: "ok" },
         previews: { status: "ok" },
+        projectPreviews: { status: "ok" },
         withdrawals: { status: "ok" },
         deliveries: { status: "ok" },
         retention: { status: "ok" },
@@ -315,6 +318,23 @@ export async function runPlatformSweeps(): Promise<PlatformSweepsResult | { skip
     } catch (err) {
       recordSweepFailure("previews", err);
       result.sweeps.previews = { status: "error", error: err instanceof Error ? err.message : String(err) };
+    }
+
+    // 3a-2. Project previews (#project-previews): check main branches for new commits, follow their builds.
+    try {
+      const swept = await sweepProjectPreviews();
+      const followed = await followProjectPreviewBuilds();
+      recordSweepSuccess("projectPreviews");
+      result.sweeps.projectPreviews = {
+        status: "ok",
+        checked: swept.checked,
+        started: swept.started,
+        followed: followed.checked,
+        failed: followed.failed,
+      };
+    } catch (err) {
+      recordSweepFailure("projectPreviews", err);
+      result.sweeps.projectPreviews = { status: "error", error: err instanceof Error ? err.message : String(err) };
     }
 
     // 3b. Ziks withdrawals (#ziki-coins): send again the ones Stripe wasn't ready to pay yet.

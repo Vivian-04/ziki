@@ -5,6 +5,7 @@ import { GitHubError, githubClientFor, installationIdForRepo, type GitHubClient 
 import { parseGitHubRepoUrl, parsePullRequestUrl, sameRepo, type RepoRef } from "@/lib/github/pull-request-url";
 import { previewSettingsValues } from "@/lib/validations/preview-settings";
 import { DEFAULT_PAGES_PROJECT, previewUrl } from "@/lib/previews/address";
+import { changesForRun, runForBuild, viewStatus, type PreviewBuildStatus, type WorkflowRun } from "@/lib/previews/run-outcome";
 
 /**
  * Pull request previews (#previews): Ziki builds each new commit of a pull
@@ -22,20 +23,19 @@ import { DEFAULT_PAGES_PROJECT, previewUrl } from "@/lib/previews/address";
  * sees an open pull request at a commit it hasn't built for that issue: after
  * delivery, when GitHub's webhook says the branch moved, and when the issue
  * page opens. One build per issue and commit.
+ *
+ * Project main-branch previews (lib/previews/project-builds.ts) use the same
+ * builder through the exported helpers below.
  */
 
-const WORKFLOW = "preview.yml";
-const BUILDER_BRANCH = "main";
-/** A dispatched build whose run never shows up is given up after this. */
-const QUEUED_TIMEOUT_MS = 15 * 60_000;
-/** A run still going after this is given up. */
-const BUILDING_TIMEOUT_MS = 45 * 60_000;
+export const WORKFLOW = "preview.yml";
+export const BUILDER_BRANCH = "main";
 /** Don't ask GitHub about the same build more often than this. */
-const RECHECK_MS = 10_000;
+export const RECHECK_MS = 10_000;
 /** Issue statuses whose pull request is worth previewing. */
 const PREVIEW_STATUSES = new Set(["in_progress", "done", "merge"]);
 
-export type PreviewBuildStatus = "queued" | "building" | "ready" | "failed";
+export type { PreviewBuildStatus };
 
 export type PreviewBuildView = {
   id: string;
@@ -48,7 +48,7 @@ export type PreviewBuildView = {
   completedAt: string | null;
 };
 
-type Builder = { repo: RepoRef; pagesProject: string };
+export type Builder = { repo: RepoRef; pagesProject: string };
 
 /** The configured preview builder, or null when previews aren't set up on this server. */
 export function previewBuilder(): Builder | null {
@@ -69,7 +69,7 @@ export async function previewsOnForIssue(bugId: string): Promise<boolean> {
   return Boolean(row?.enabled);
 }
 
-async function builderClient(builder: Builder): Promise<GitHubClient> {
+export async function builderClient(builder: Builder): Promise<GitHubClient> {
   const installationId = await installationIdForRepo(builder.repo.owner, builder.repo.repo);
   if (!installationId) {
     throw new GitHubError(
@@ -80,12 +80,53 @@ async function builderClient(builder: Builder): Promise<GitHubClient> {
   return githubClientFor({ githubInstallationId: installationId });
 }
 
-const builderPath = (builder: Builder) =>
+export const builderPath = (builder: Builder) =>
   `/repos/${encodeURIComponent(builder.repo.owner)}/${encodeURIComponent(builder.repo.repo)}/actions`;
 
-function oneLine(error: unknown): string {
+export function oneLine(error: unknown): string {
   const message = error instanceof GitHubError ? error.message : "Ziki couldn't start the preview builder.";
   return message.replace(/\s+/g, " ").slice(0, 300);
+}
+
+/** What one builder run builds. */
+export type PreviewDispatch = {
+  buildId: string;
+  repository: string;
+  headSha: string;
+  /** The Pages branch's number: the pull request, or 0 for a project's main branch. */
+  pr: number;
+  settings: ReturnType<typeof previewSettingsValues>;
+};
+
+/** Start the builder for one build. Throws when GitHub refuses; returns the run when GitHub says which it is. */
+export async function dispatchPreviewBuild(
+  builder: Builder,
+  dispatch: PreviewDispatch,
+): Promise<{ runId: string; runUrl: string | null } | null> {
+  const client = await builderClient(builder);
+  const { settings } = dispatch;
+  const dispatched = await client.send<{ workflow_run_id?: number; html_url?: string } | undefined>(
+    "POST",
+    `${builderPath(builder)}/workflows/${WORKFLOW}/dispatches`,
+    {
+      ref: BUILDER_BRANCH,
+      // GitHub answers with the run when it can; otherwise Ziki finds it by build ID.
+      return_run_details: true,
+      inputs: {
+        build_id: dispatch.buildId,
+        repository: dispatch.repository,
+        ref: dispatch.headSha,
+        pr: String(dispatch.pr),
+        install_command: settings.installCommand ?? "",
+        build_command: settings.buildCommand,
+        root_dir: settings.rootDir,
+        output_dir: settings.outputDir,
+        node_version: settings.nodeVersion,
+        build_variables: JSON.stringify(settings.buildVariables),
+      },
+    },
+  );
+  return dispatched?.workflow_run_id ? { runId: String(dispatched.workflow_run_id), runUrl: dispatched.html_url ?? null } : null;
 }
 
 export type PreviewTrigger = {
@@ -138,32 +179,17 @@ export async function startPreviewBuildIfDue(trigger: PreviewTrigger): Promise<"
   }
 
   try {
-    const client = await builderClient(builder);
-    const dispatched = await client.send<{ workflow_run_id?: number; html_url?: string } | undefined>(
-      "POST",
-      `${builderPath(builder)}/workflows/${WORKFLOW}/dispatches`,
-      {
-        ref: BUILDER_BRANCH,
-        // GitHub answers with the run when it can; otherwise Ziki finds it by build ID.
-        return_run_details: true,
-        inputs: {
-          build_id: build.id,
-          repository,
-          ref: trigger.headSha,
-          pr: String(pull.number),
-          install_command: settings.installCommand ?? "",
-          build_command: settings.buildCommand,
-          root_dir: settings.rootDir,
-          output_dir: settings.outputDir,
-          node_version: settings.nodeVersion,
-          build_variables: JSON.stringify(settings.buildVariables),
-        },
-      },
-    );
-    if (dispatched?.workflow_run_id) {
+    const run = await dispatchPreviewBuild(builder, {
+      buildId: build.id,
+      repository,
+      headSha: trigger.headSha,
+      pr: pull.number,
+      settings,
+    });
+    if (run) {
       await prisma.previewBuild.update({
         where: { id: build.id },
-        data: { status: "building", runId: String(dispatched.workflow_run_id), runUrl: dispatched.html_url ?? null },
+        data: { status: "building", runId: run.runId, runUrl: run.runUrl },
       });
     }
     return "started";
@@ -177,14 +203,6 @@ export async function startPreviewBuildIfDue(trigger: PreviewTrigger): Promise<"
   }
 }
 
-type WorkflowRun = {
-  id: number;
-  status: string;
-  conclusion: string | null;
-  html_url: string;
-  display_title?: string;
-};
-
 type OpenBuild = {
   id: string;
   status: string;
@@ -195,60 +213,29 @@ type OpenBuild = {
   updatedAt: Date;
 };
 
+/** Ask GitHub for one build's run: by its ID once known, otherwise by the build ID in the run's name. */
+export async function findBuilderRun(
+  builder: Builder,
+  client: GitHubClient,
+  build: { id: string; runId: string | null; createdAt: Date },
+): Promise<WorkflowRun | null> {
+  if (build.runId) {
+    return client.getOrNull<WorkflowRun>(`${builderPath(builder)}/runs/${encodeURIComponent(build.runId)}`);
+  }
+  // The run's name carries the build ID (preview.yml `run-name`).
+  const since = new Date(build.createdAt.getTime() - 60_000).toISOString();
+  const runs = await client.get<{ workflow_runs: WorkflowRun[] }>(
+    `${builderPath(builder)}/workflows/${WORKFLOW}/runs?event=workflow_dispatch&per_page=50&created=${encodeURIComponent(`>=${since}`)}`,
+  );
+  return runForBuild(runs.workflow_runs, build.id);
+}
+
 /** Ask GitHub where one build's run is, and record it. */
 async function followBuild(builder: Builder, client: GitHubClient, build: OpenBuild): Promise<void> {
-  const now = Date.now();
-  let run: WorkflowRun | null = null;
-  if (build.runId) {
-    run = await client.getOrNull<WorkflowRun>(`${builderPath(builder)}/runs/${encodeURIComponent(build.runId)}`);
-  } else {
-    // The run's name carries the build ID (preview.yml `run-name`).
-    const since = new Date(build.createdAt.getTime() - 60_000).toISOString();
-    const runs = await client.get<{ workflow_runs: WorkflowRun[] }>(
-      `${builderPath(builder)}/workflows/${WORKFLOW}/runs?event=workflow_dispatch&per_page=50&created=${encodeURIComponent(`>=${since}`)}`,
-    );
-    run = runs.workflow_runs.find((candidate) => candidate.display_title?.includes(`(${build.id})`)) ?? null;
-  }
-
-  if (!run) {
-    const waited = now - build.createdAt.getTime();
-    if (waited > QUEUED_TIMEOUT_MS) {
-      await prisma.previewBuild.update({
-        where: { id: build.id },
-        data: { status: "failed", error: "The preview builder never started a run for this commit.", completedAt: new Date() },
-      });
-    } else {
-      await prisma.previewBuild.update({ where: { id: build.id }, data: { updatedAt: new Date() } });
-    }
-    return;
-  }
-
-  const base = { runId: String(run.id), runUrl: run.html_url };
-  if (run.status !== "completed") {
-    const timedOut = now - build.createdAt.getTime() > BUILDING_TIMEOUT_MS;
-    await prisma.previewBuild.update({
-      where: { id: build.id },
-      data: timedOut
-        ? { ...base, status: "failed", error: "The preview build took too long.", completedAt: new Date() }
-        : { ...base, status: "building" },
-    });
-    return;
-  }
-  if (run.conclusion === "success") {
-    await prisma.previewBuild.update({
-      where: { id: build.id },
-      data: { ...base, status: "ready", url: previewUrl(build.repository, build.pullNumber, builder.pagesProject), error: null, completedAt: new Date() },
-    });
-    return;
-  }
+  const run = await findBuilderRun(builder, client, build);
   await prisma.previewBuild.update({
     where: { id: build.id },
-    data: {
-      ...base,
-      status: "failed",
-      error: run.conclusion === "cancelled" ? "The preview build was cancelled." : "The preview build failed. Check that the install and build commands and the output folder in the project's preview settings match the repository.",
-      completedAt: new Date(),
-    },
+    data: changesForRun(run, build.createdAt, previewUrl(build.repository, build.pullNumber, builder.pagesProject)),
   });
 }
 
@@ -304,7 +291,7 @@ export async function latestPreviewBuild(bugId: string, pullRequestUrl: string |
   if (!build) return null;
   return {
     id: build.id,
-    status: (["queued", "building", "ready", "failed"].includes(build.status) ? build.status : "failed") as PreviewBuildStatus,
+    status: viewStatus(build.status),
     headSha: build.headSha,
     url: build.url,
     runUrl: build.runUrl,

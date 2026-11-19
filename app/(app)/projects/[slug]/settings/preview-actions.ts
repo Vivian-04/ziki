@@ -11,6 +11,12 @@ import {
   previewSettingsValues,
   type PreviewSettingsValues,
 } from "@/lib/validations/preview-settings";
+import {
+  followProjectPreviewBuilds,
+  latestProjectPreview,
+  startProjectPreviewIfDue,
+} from "@/lib/previews/project-builds";
+import type { PreviewBuildView } from "@/lib/previews/builds";
 
 export type PreviewSettingsActionResult =
   | { ok: true }
@@ -104,4 +110,49 @@ export async function updateProjectPreviewSettingsAction(
 
   revalidatePath(`/projects/${encodeURIComponent(project.slug)}/settings`);
   return { ok: true };
+}
+
+export type ProjectPreviewStatusResult =
+  | { ok: true; build: PreviewBuildView | null; lastReadyUrl: string | null; message?: string }
+  | { ok: false; error: string };
+
+/** The project in the admin's current organisation, or an error to show. */
+async function projectForPreviewAdmin(slug: unknown): Promise<{ id: string } | { error: string }> {
+  if (typeof slug !== "string" || !slug.trim()) return { error: "Project not found." };
+  const user = await requireUser();
+  const organisationId = await currentOrganisationIdFor(user.id);
+  if (!organisationId) return { error: NO_ORGANISATION_MESSAGE };
+  if (!(await isAdminOfOrganisation(user, organisationId))) {
+    return { error: "Only organisation owners and admins can see the project preview." };
+  }
+  const project = await prisma.project.findFirst({ where: { organisationId, slug: slug.trim() }, select: { id: true } });
+  return project ?? { error: "Project not found." };
+}
+
+/** The main-branch preview card (#project-previews): ask the builder again, then answer with the latest build. */
+export async function projectPreviewStatusAction(slug: string): Promise<ProjectPreviewStatusResult> {
+  const project = await projectForPreviewAdmin(slug);
+  if ("error" in project) return { ok: false, error: project.error };
+  await followProjectPreviewBuilds({ projectId: project.id, limit: 3 }).catch((error) =>
+    console.error("[project-previews] follow failed", error),
+  );
+  return { ok: true, ...(await latestProjectPreview(project.id)) };
+}
+
+/** Build now (#project-previews): build the main branch's latest commit straight away. */
+export async function buildProjectPreviewNowAction(slug: string): Promise<ProjectPreviewStatusResult> {
+  const project = await projectForPreviewAdmin(slug);
+  if ("error" in project) return { ok: false, error: project.error };
+  const result = await startProjectPreviewIfDue(project.id, { force: true });
+  const latest = await latestProjectPreview(project.id);
+  const message =
+    result.outcome === "started"
+      ? "Building the main branch's latest commit."
+      : result.outcome === "up_to_date"
+        ? "The preview already shows the main branch's latest commit."
+        : result.reason;
+  if (result.outcome === "failed" || result.outcome === "skipped") {
+    return { ok: false, error: message };
+  }
+  return { ok: true, ...latest, message };
 }
