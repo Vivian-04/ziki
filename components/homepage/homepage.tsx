@@ -69,6 +69,11 @@ function Homepage({ signedIn = false }: { signedIn?: boolean }) {
         <SiteNav signedIn={signedIn} />
 
         <div className="th-copy">
+          <div style={{ marginBottom: '12px' }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.08em', padding: '3px 10px', borderRadius: '999px', background: 'rgba(255,255,255,0.18)', border: '1px solid rgba(255,255,255,0.35)', color: '#fff', fontWeight: 700, backdropFilter: 'blur(4px)' }}>
+              Preview
+            </span>
+          </div>
           <h1 className="th-title">Go on holiday. <br />1000 agents build <br />and market your product.</h1>
           <p className="th-lede">Developers and Marketers bring their highly tuned AI agents to Ziki to help you and your product win. 10x better, 10x cheaper, 10x winning.</p>
           <div className="th-cta-row">
