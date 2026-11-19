@@ -1,24 +1,43 @@
 # Automatic PR previews that run entirely on GitHub's machines.
 # No laptop, no Docker Desktop, no self-hosted runner.
 #
-#   PR opened / new commit -> build the PR's image
-#                          -> start a throwaway Kubernetes cluster (kind) on a GitHub runner
-#                          -> deploy the preview there: app + its own Postgres + public tunnel
-#                          -> comment the link and a login on the PR
-#                          -> keep it up for PREVIEW_MINUTES (default 45), then it ends
-#   New commit or PR closed -> the running preview is stopped
+# Two ways to start one:
+#   1. Open a PR in this repo (or push a commit to it): it builds by itself and
+#      a comment on the PR goes "Building..." -> link + login -> "ended".
+#   2. Actions tab -> "PR preview (cloud)" -> Run workflow -> type ANY PR number
+#      from emerjent/ziki (or another public repo). The link and login appear in
+#      the run's Summary.
 #
-# Needs the previews/ folder on the PR's base branch (main).
-# Optional repo variable PREVIEW_MINUTES (max about 300).
+# Each preview: a throwaway Kubernetes cluster (kind) on a GitHub runner, with the
+# app, its own empty Postgres, and a public tunnel link. It stays up for the
+# chosen minutes (default 45; GitHub stops any job after 6 hours).
+#
+# Needs the previews/ folder on this repo's main branch.
 name: PR preview (cloud)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to preview"
+        required: true
+      repository:
+        description: "Repository the PR is in"
+        required: false
+        default: "emerjent/ziki"
+      minutes:
+        description: "How long the preview stays up"
+        required: false
+        default: "45"
+        type: choice
+        options: ["30", "45", "60", "90", "120", "180", "240"]
 
-# A new commit, or closing the PR, stops the running preview.
+# A new commit (or closing the PR, or previewing the same PR again) stops the
+# preview that's already running for it.
 concurrency:
-  group: pr-preview-cloud-${{ github.event.pull_request.number }}
+  group: pr-preview-cloud-${{ inputs.repository || github.repository }}-${{ inputs.pr || github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
@@ -27,25 +46,108 @@ permissions:
   pull-requests: write
 
 jobs:
+  setup:
+    # Manual runs, or PRs made inside this repo (never from other people's forks).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      repo: ${{ steps.ctx.outputs.repo }}
+      pr: ${{ steps.ctx.outputs.pr }}
+      sha: ${{ steps.ctx.outputs.sha }}
+      can_comment: ${{ steps.ctx.outputs.can_comment }}
+    steps:
+      - name: Work out which PR to preview
+        id: ctx
+        uses: actions/github-script@v7
+        env:
+          IN_REPO: ${{ inputs.repository }}
+          IN_PR: ${{ inputs.pr }}
+          MINUTES: ${{ inputs.minutes || vars.PREVIEW_MINUTES || '45' }}
+        with:
+          script: |
+            const marker = '<!-- ziki-preview -->';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            let repoFull, pr, sha, canComment;
+
+            if (context.eventName === 'workflow_dispatch') {
+              repoFull = (process.env.IN_REPO || 'emerjent/ziki').trim();
+              if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoFull)) {
+                core.setFailed('Repository must look like owner/name, e.g. emerjent/ziki');
+                return;
+              }
+              pr = Number(String(process.env.IN_PR).replace('#', '').trim());
+              if (!Number.isInteger(pr) || pr <= 0) {
+                core.setFailed('PR must be a number, e.g. 712');
+                return;
+              }
+              const [owner, repo] = repoFull.split('/');
+              let data;
+              try {
+                ({ data } = await github.rest.pulls.get({ owner, repo, pull_number: pr }));
+              } catch (err) {
+                core.setFailed(`Couldn't find PR #${pr} in ${repoFull}: ${err.message}`);
+                return;
+              }
+              sha = data.head.sha;
+              canComment = false;
+              await core.summary
+                .addHeading(`Building a preview of ${repoFull}#${pr}`, 3)
+                .addRaw(`"${data.title}" at commit \`${sha.slice(0, 7)}\`. `)
+                .addRaw(`It stays up for ${process.env.MINUTES} minutes once ready. `)
+                .addRaw('The link and login will appear in the Summary of the "preview" job.')
+                .write();
+            } else {
+              repoFull = `${context.repo.owner}/${context.repo.repo}`;
+              pr = context.payload.pull_request.number;
+              sha = context.payload.pull_request.head.sha;
+              canComment = true;
+
+              // Tell the PR straight away that a preview is on its way.
+              const body = [
+                marker,
+                '### Building preview...',
+                '',
+                `Commit \`${sha.slice(0, 7)}\` is being built and deployed. This usually takes 15 to 25 minutes.`,
+                'This comment will update with the link when it is ready.',
+                '',
+                `[Watch progress](${runUrl})`,
+              ].join('\n');
+              const { owner, repo } = context.repo;
+              const issue_number = pr;
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+              const mine = comments.find(c => c.body && c.body.includes(marker));
+              if (mine) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              }
+            }
+
+            core.setOutput('repo', repoFull);
+            core.setOutput('pr', String(pr));
+            core.setOutput('sha', sha);
+            core.setOutput('can_comment', String(canComment));
+
   build:
-    # Only PRs made inside this repo, never from other people's forks.
-    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 40
     outputs:
       image: ${{ steps.names.outputs.image }}
-      sha: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ needs.setup.outputs.repo }}
+          ref: ${{ needs.setup.outputs.sha }}
           persist-credentials: false
 
       - name: Work out the image name
         id: names
         env:
-          PR: ${{ github.event.pull_request.number }}
-          SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ needs.setup.outputs.pr }}
+          SHA: ${{ needs.setup.outputs.sha }}
           OWNER: ${{ github.repository_owner }}
         run: |
           owner_lc="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
@@ -69,18 +171,18 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-
   preview:
-    needs: build
+    needs: [setup, build]
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
-      MINUTES: ${{ vars.PREVIEW_MINUTES || '45' }}
+      MINUTES: ${{ inputs.minutes || vars.PREVIEW_MINUTES || '45' }}
     steps:
-      # Scripts come from the base branch, never from the PR.
+      # Scripts come from this repo's main branch (or the PR's base), never from
+      # the PR being previewed.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           sparse-checkout: previews
           persist-credentials: false
 
@@ -93,34 +195,39 @@ jobs:
         id: deploy
         env:
           PREVIEW_TUNNEL: "1"
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-          SHA: ${{ needs.build.outputs.sha }}
+          REPO: ${{ needs.setup.outputs.repo }}
+          PR: ${{ needs.setup.outputs.pr }}
+          SHA: ${{ needs.setup.outputs.sha }}
           IMAGE: ${{ needs.build.outputs.image }}
         run: bash previews/scripts/deploy-preview.sh "$REPO" "$PR" "$SHA" "$IMAGE"
 
-      - name: Comment the link on the PR
+      - name: Share the link
         uses: actions/github-script@v7
         env:
           URL: ${{ steps.deploy.outputs.url }}
           NS: ${{ steps.deploy.outputs.namespace }}
-          SHA: ${{ needs.build.outputs.sha }}
+          SRC: ${{ needs.setup.outputs.repo }}
+          PR: ${{ needs.setup.outputs.pr }}
+          SHA: ${{ needs.setup.outputs.sha }}
           IMAGE: ${{ needs.build.outputs.image }}
           ADMIN_EMAIL: ${{ steps.deploy.outputs.admin_email }}
           ADMIN_PASSWORD: ${{ steps.deploy.outputs.admin_password }}
+          CAN_COMMENT: ${{ needs.setup.outputs.can_comment }}
         with:
           script: |
             const marker = '<!-- ziki-preview -->';
             const e = process.env;
             const { owner, repo } = context.repo;
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const commitUrl = `${context.serverUrl}/${owner}/${repo}/commit/${e.SHA}`;
+            const prUrl = `${context.serverUrl}/${e.SRC}/pull/${e.PR}`;
+            const commitUrl = `${context.serverUrl}/${e.SRC}/commit/${e.SHA}`;
             const until = new Date(Date.now() + Number(e.MINUTES) * 60000).toISOString().slice(11, 16);
-            const body = [
-              marker,
+            const lines = [
               '### Preview ready',
               '',
               `**${e.URL}**`,
+              '',
+              `Preview of [${e.SRC}#${e.PR}](${prUrl}) at commit [\`${e.SHA.slice(0, 7)}\`](${commitUrl}).`,
               '',
               '| Sign in | |',
               '| --- | --- |',
@@ -131,16 +238,61 @@ jobs:
               '',
               '<details><summary>How this preview was made</summary>',
               '',
-              `1. This PR got commit [\`${e.SHA.slice(0, 7)}\`](${commitUrl}).`,
-              `2. GitHub Actions built its Docker image: \`${e.IMAGE}\` ([run](${runUrl})).`,
-              '3. A throwaway Kubernetes cluster started on a GitHub runner.',
-              `4. The preview was deployed to namespace \`${e.NS}\`: the app, its own empty Postgres, and a tunnel for the public link.`,
-              '5. The app ran its database migrations on start, then a preview login was created.',
-              '6. This comment was posted. A new commit replaces the preview; closing the PR ends it.',
+              `1. GitHub Actions built the PR's Docker image: \`${e.IMAGE}\` ([run](${runUrl})).`,
+              '2. A throwaway Kubernetes cluster started on a GitHub runner.',
+              `3. The preview was deployed to namespace \`${e.NS}\`: the app, its own empty Postgres, and a tunnel for the public link.`,
+              '4. The app ran its database migrations on start, then a preview login was created.',
+              '5. A new commit replaces the preview; closing the PR ends it.',
               '',
               '</details>',
-            ].join('\n');
-            const issue_number = context.payload.pull_request.number;
+            ];
+            await core.summary.addRaw(lines.join('\n')).write();
+            if (e.CAN_COMMENT === 'true') {
+              const body = [marker, ...lines].join('\n');
+              const issue_number = Number(e.PR);
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+              const mine = comments.find(c => c.body && c.body.includes(marker));
+              if (mine) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              }
+            }
+
+      - name: Keep the preview up
+        run: sleep $(( MINUTES * 60 ))
+
+      - name: Mark the preview as ended
+        if: always() && steps.deploy.outcome == 'success' && needs.setup.outputs.can_comment == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR: ${{ needs.setup.outputs.pr }}
+        with:
+          script: |
+            const marker = '<!-- ziki-preview -->';
+            const body = `${marker}\n### Preview ended\n\nThis preview has been shut down and its database deleted. Push a new commit to get a fresh one.`;
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.PR);
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const mine = comments.find(c => c.body && c.body.includes(marker));
+            if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+
+  # If the build or deploy breaks, say so on the PR instead of leaving "Building..." forever.
+  report-failure:
+    needs: [setup, build, preview]
+    if: failure() && needs.setup.outputs.can_comment == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PR: ${{ needs.setup.outputs.pr }}
+        with:
+          script: |
+            const marker = '<!-- ziki-preview -->';
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = `${marker}\n### Preview failed\n\nSomething went wrong while building or deploying this preview. [See what happened](${runUrl}). Push a new commit to try again.`;
+            const issue_number = Number(process.env.PR);
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
             const mine = comments.find(c => c.body && c.body.includes(marker));
             if (mine) {
@@ -149,25 +301,9 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
-      - name: Keep the preview up
-        run: sleep $(( MINUTES * 60 ))
-
-      - name: Mark the preview as ended
-        if: always() && steps.deploy.outcome == 'success'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const marker = '<!-- ziki-preview -->';
-            const body = `${marker}\n### Preview ended\n\nThis preview has been shut down and its database deleted. Push a new commit to get a fresh one.`;
-            const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
-            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
-            const mine = comments.find(c => c.body && c.body.includes(marker));
-            if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
-
   # Closing the PR starts this run, which (through concurrency) stops the running preview.
   closed:
-    if: github.event.action == 'closed'
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
     steps:
       - run: echo "PR closed; any running preview for it has been stopped."
