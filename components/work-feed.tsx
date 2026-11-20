@@ -2,11 +2,15 @@
 
 import Link from "next/link";
 import type React from "react";
-import { useState, useTransition } from "react";
+import { useEffect, useState, useSyncExternalStore, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { approveDeliveredWorkAction, confirmLiveWorkAction } from "@/app/actions/human-steps";
+import { quickIdeaVerdictAction } from "@/app/actions/idea-verdicts";
+import { CelebrationStyles, DancingAgent, Fireworks, Hearts } from "@/components/celebrate";
 import { LocalTime } from "@/components/local-time";
+import { IDEA_ADDED_EVENT } from "@/lib/just-added";
 import { RichText } from "@/components/rich-text";
+import { ScreenshotPreview, type PreviewShot } from "@/components/screenshot-preview";
 import { BASE_PATH } from "@/lib/base-path";
 import { formatIssueNumber } from "@/lib/issue-number";
 import { cleanTitle } from "@/lib/issue-title";
@@ -33,8 +37,10 @@ export type WorkFeedItem = {
   body: string;
   files: { id: string; name: string; type: string; size: number }[];
   decision: { label: string; href: string };
-  /** Delivered work: where it was delivered (its preview, else its link or pull request), and whether it awaits approval. */
-  viewUrl: string | null;
+  /** Delivered work: where it can be seen running (its preview, else the delivery's link), or null. */
+  liveUrl: string | null;
+  /** Its pull request, kept apart from where it runs. */
+  pullRequestUrl: string | null;
   /** Delivered work: the delivery's screenshots (links) of how it looks now, shown as a preview when the card is opened. */
   screenshots: string[];
   /** And of how it looked when the work started (#delivery-screenshots). */
@@ -60,6 +66,16 @@ export type WorkFeedItem = {
   startedAt: Date | null;
   /** In the Stalled section: since when it hasn't moved; null elsewhere. */
   stalledSince: Date | null;
+  /** Who delivered it: the person the delivering agent works for, or null. */
+  deliveredBy: string | null;
+  /** When its pull request was merged and who merged it (the GitHub account, else the reporting agent's person). */
+  merged?: { at: Date; by: string | null } | null;
+  /** The newest delivery, at the top of Needs your OK: celebrated with a dancing agent and fireworks (#just-delivered). */
+  justDelivered: boolean;
+  /** Whether an agent holds it now (an active claim). */
+  held: boolean;
+  /** In the Stalled section: why it is stalled, in a sentence; null elsewhere. */
+  stallReason: string | null;
   /** Why it isn't merged yet, from the latest pull request report, or null when nothing is in the way. */
   mergeHold: string | null;
 };
@@ -122,8 +138,12 @@ export function StatusBadge({ substatus, className = "" }: { substatus: Substatu
  * last moved, and a pill on the right with its status, or Approve on delivered work. Clicking a card unfolds
  * it downwards, in place, as an opened email; clicking its head folds it.
  */
-export function WorkFeed({ items, groups, title, toolbar, empty, footer }: {
+export function WorkFeed({ items, groups, title, toolbar, empty, footer, justAdded = [], justAddedCount = 0 }: {
   items: WorkFeedItem[];
+  /** New ideas that need your OK (#just-added), newest first, at the top of Needs your OK; the one just filed flashes. */
+  justAdded?: JustAddedIdea[];
+  /** How many there are in all, counted into Needs your OK. */
+  justAddedCount?: number;
   /**
    * The Work Feed's sections (#work-feed-sections), top to bottom: each its title, a line on what it holds, how many,
    * a few cards, and a link to all of it. Given instead of `items`.
@@ -139,10 +159,29 @@ export function WorkFeed({ items, groups, title, toolbar, empty, footer }: {
 }) {
   // The opened card, or null for none.
   const [openId, setOpenId] = useState<string | null>(null);
+  // The idea the chat just filed (#just-added): it flashes as it appears, for a few seconds.
+  const [flash, setFlash] = useState<number | null>(null);
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAdded = (event: Event) => {
+      const number = (event as CustomEvent<{ number: number }>).detail?.number;
+      if (!number) return;
+      setFlash(number);
+      clearTimeout(timer);
+      timer = setTimeout(() => setFlash(null), 6000);
+    };
+    window.addEventListener(IDEA_ADDED_EVENT, onAdded);
+    return () => {
+      window.removeEventListener(IDEA_ADDED_EVENT, onAdded);
+      clearTimeout(timer);
+    };
+  }, []);
 
   // A list of cards on the gray inset, as Marketing's are.
-  const cards = (list: WorkFeedItem[], label: string) => (
+  // `lead`: cards that go first (the new ideas in Needs your OK).
+  const cards = (list: WorkFeedItem[], label: string, lead?: React.ReactNode) => (
         <ul className="m-0 flex list-none flex-col gap-3 rounded-xl bg-zk-bg p-4" aria-label={label}>
+          {lead}
           {list.map((item) => {
             const who = item.who ?? "Nobody yet";
             return (
@@ -151,7 +190,10 @@ export function WorkFeed({ items, groups, title, toolbar, empty, footer }: {
                   // Opened, the card unfolds into the whole of it, as an opened email.
                   <FeedCard item={item} id={`work-feed-detail-${item.id}`} onClose={() => setOpenId(null)} />
                 ) : (
-                  <div className="flex items-center gap-4 rounded-2xl border border-zk-border bg-white px-5 py-4 transition hover:bg-zk-bg">
+                  <div className={item.justDelivered ? "relative overflow-hidden rounded-2xl border border-[#efd9a6] bg-white shadow-[0_2px_10px_rgba(0,0,0,0.05)]" : ""}>
+                  {/* The newest delivery (#just-delivered): who delivered it, with a dancing agent and fireworks. */}
+                  {item.justDelivered ? <JustDelivered by={item.deliveredBy} /> : null}
+                  <div className={`flex items-center gap-4 bg-white px-5 py-4 transition hover:bg-zk-bg ${item.justDelivered ? "" : "rounded-2xl border border-zk-border"}`}>
                     <button
                       type="button"
                       aria-expanded={false}
@@ -182,6 +224,7 @@ export function WorkFeed({ items, groups, title, toolbar, empty, footer }: {
                       <StatusBadge substatus={item.substatus} className="max-sm:hidden" />
                     )}
                   </div>
+                  </div>
                 )}
               </li>
             );
@@ -201,25 +244,28 @@ export function WorkFeed({ items, groups, title, toolbar, empty, footer }: {
               <div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 px-1">
                 <div className="min-w-0">
                   <h2 id={`work-feed-${group.key}`} className="m-0 inline text-[15px] font-semibold text-zk-text">
-                    {group.title} <span className="ml-1 text-[13px] font-medium tabular-nums text-zk-muted">{group.count}</span>
+                    {group.title} <span className="ml-1 text-[13px] font-medium tabular-nums text-zk-muted">{group.count + (group.key === "needs" ? justAddedCount : 0)}</span>
                   </h2>
                 </div>
                 {group.moreHref ? (
                   <Link href={group.moreHref} className={`shrink-0 text-[13px] font-medium text-zk-accent hover:underline ${focus}`}>
-                    Show all {group.count} →
+                    Show all {group.count + (group.key === "needs" ? justAddedCount : 0)} →
                   </Link>
                 ) : null}
               </div>
-              {group.items.length > 0 ? cards(group.items, group.title) : (
+              {group.items.length > 0 || (group.key === "needs" && justAdded.length > 0)
+                ? cards(group.items, group.title, group.key === "needs" && justAdded.length > 0 ? <IdeaOkCards ideas={justAdded} flash={flash} /> : null)
+                : (
                 <p className="m-0 rounded-xl bg-zk-bg px-4 py-4 text-[13px] text-zk-muted">Nothing here right now.</p>
               )}
             </section>
           ))}
         </div>
-      ) : items.length === 0 ? (
+      ) : items.length === 0 && justAdded.length === 0 ? (
         <div className="rounded-2xl border border-zk-border bg-white p-5">{empty}</div>
       ) : (
-        cards(items, "Work")
+        // One section in full: Needs your OK starts with its new ideas.
+        cards(items, "Work", justAdded.length > 0 ? <IdeaOkCards ideas={justAdded} flash={flash} /> : null)
       )}
       {footer ? <div className="mt-3">{footer}</div> : null}
     </section>
@@ -344,14 +390,13 @@ function FeedCard({ item, id, onClose }: { item: WorkFeedItem; id: string; onClo
     <article id={id} aria-labelledby={`${id}-title`} className="my-1 rounded-2xl border border-zk-border bg-white px-5 pb-5 pt-4 shadow-[0_2px_10px_rgba(0,0,0,0.06)]">
       <div className="flex flex-wrap items-center gap-3 border-b border-zk-divider pb-4">
         <button type="button" aria-expanded={true} aria-controls={id} onClick={onClose} className={`flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-lg text-left ${focus}`}>
-          <span aria-hidden="true" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[11px] text-[15px] font-semibold shadow-[inset_0_1px_0_rgba(255,255,255,0.25)]" style={TILE_TONES[item.who ? toneForName(item.who) : "grey"]}>
-            {who.charAt(0).toUpperCase()}
-          </span>
+          <IssueThumb item={item} />
           <span className="min-w-0">
-            <span className={`block truncate text-[15px] font-semibold ${item.who ? "text-zk-text" : "text-zk-muted"}`}>{who}</span>
-            <span className="block truncate text-[13px] text-zk-muted">
+            {/* The issue's title heads the card; who is on it goes in the line under it. */}
+            <span id={`${id}-title`} className="block text-[16px] font-semibold leading-snug text-zk-text">{cleanTitle(item.title)}</span>
+            <span className="mt-0.5 block truncate text-[13px] text-zk-muted">
               <span style={{ color: tone.color }}>{kind.label}</span> · <span className="tabular-nums">{formatIssueNumber(item.number)}</span>
-              {item.projectName ? ` · ${item.projectName}` : ""} · <LocalTime date={item.at} />
+              {item.projectName ? ` · ${item.projectName}` : ""} · {who} · <LocalTime date={item.at} />
             </span>
           </span>
         </button>
@@ -376,12 +421,19 @@ function FeedCard({ item, id, onClose }: { item: WorkFeedItem; id: string; onClo
         )}
       </div>
       {/* Delivered and live work: what it says on the left, a preview of what was delivered on the right (under it on a phone). */}
-      <div className={item.kind === "delivered" || item.kind === "live" ? "grid gap-6 md:grid-cols-[minmax(0,1fr)_minmax(0,320px)]" : ""}>
+      <div className={item.kind === "delivered" || item.kind === "live" || item.stallReason ? "grid gap-6 md:grid-cols-[minmax(0,1fr)_minmax(0,340px)]" : ""}>
       <div className="min-w-0 pt-4 text-[14.5px] leading-relaxed text-zk-text2">
-        <h2 id={`${id}-title`} className="m-0 mb-3 text-[16px] font-semibold leading-snug text-zk-text">{cleanTitle(item.title)}</h2>
         {/* When it was delivered, and why it isn't merged yet when the latest pull request report says why. */}
         {item.deliveredAt ? (
-          <p className="m-0 mb-3 text-[13px] text-zk-muted">Delivered <LocalTime date={item.deliveredAt} /></p>
+          <p className="m-0 mb-3 text-[13px] text-zk-muted">Delivered <LocalTime date={item.deliveredAt} absolute yearIfOld /></p>
+        ) : null}
+        {item.stallReason ? (
+          <div role="note" className="mb-4 rounded-xl border border-zk-warn-bd bg-zk-warn-bg px-3.5 py-2.5 text-[13.5px] text-zk-warn-fg">
+            <p className="m-0 font-semibold">
+              Why it&apos;s stalled{item.stalledSince ? <span className="font-normal" suppressHydrationWarning> · no movement for {since(item.stalledSince)}</span> : null}
+            </p>
+            <p className="m-0 mt-0.5">{item.stallReason}</p>
+          </div>
         ) : null}
         {item.mergeHold ? (
           <div role="note" className="mb-4 rounded-xl border border-zk-warn-bd bg-zk-warn-bg px-3.5 py-2.5 text-[13.5px] text-zk-warn-fg">
@@ -389,17 +441,27 @@ function FeedCard({ item, id, onClose }: { item: WorkFeedItem; id: string; onClo
             <p className="m-0 mt-0.5 whitespace-pre-line">{item.mergeHold}</p>
           </div>
         ) : null}
-        {/* The summary, unless the description already opens with it. */}
-        {item.summary && !item.body?.trimStart().startsWith(item.summary.trim().split("\n")[0]) ? <p className="m-0 mb-3 whitespace-pre-line">{item.summary}</p> : null}
-        {item.body ? (
-          // Quiet headings, as in a letter, not a document.
-          <RichText content={item.body} className="text-[14.5px] [&_h1]:text-[14.5px] [&_h2]:text-[14.5px] [&_h3]:text-[14.5px] [&_h4]:text-[14.5px] [&_h1]:font-semibold [&_h2]:font-semibold [&_h3]:font-semibold" />
-        ) : item.summary ? null : (
-          <p className="m-0 text-zk-muted">No description.</p>
+        {/* Only the summary, for a quick glance: the full description is on the issue's page. An issue without one
+            shows the description's first paragraph. */}
+        {item.summary ? (
+          <p className="m-0 whitespace-pre-line">{item.summary}</p>
+        ) : item.body ? (
+          <RichText content={firstParagraph(item.body)} className="text-[14.5px]" />
+        ) : (
+          <p className="m-0 text-zk-muted">No summary.</p>
         )}
-        {item.reporter ? <p className="m-0 mt-4 text-[13.5px] text-zk-muted">Reported by {item.reporter}</p> : null}
       </div>
-      {item.kind === "delivered" || item.kind === "live" ? <DeliveryPreview item={item} /> : null}
+      {/* The right column: the full issue's link on top, then, when stalled, what you can do to move it on, then the
+          preview of delivered work. */}
+      {item.stallReason || item.kind === "delivered" || item.kind === "live" ? (
+        <div className="min-w-0">
+          <div className="mt-4 flex justify-end">
+            <FullIssueLink href={item.href} />
+          </div>
+          {item.stallReason ? <StalledFix item={item} /> : null}
+          {item.kind === "delivered" || item.kind === "live" ? <DeliveryPreview item={item} /> : null}
+        </div>
+      ) : null}
       </div>
       {item.files.length > 0 ? (
         <ul aria-label="Files" className="m-0 mt-5 grid list-none grid-cols-1 gap-3 p-0 sm:grid-cols-2">
@@ -430,12 +492,22 @@ function FeedCard({ item, id, onClose }: { item: WorkFeedItem; id: string; onClo
           })}
         </ul>
       ) : null}
-      {/* At the bottom: the whole issue. */}
-      <Link href={item.href} className={`mt-5 inline-flex items-center gap-1 text-[13.5px] font-medium text-zk-accent hover:underline ${focus}`}>
-        Open the full issue
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
-      </Link>
+      {/* At the bottom, on one line: who reported it on the left, the whole issue on the right. */}
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        {item.reporter ? <p className="m-0 text-[13.5px] text-zk-muted">Reported by {item.reporter}</p> : <span aria-hidden="true" />}
+        <FullIssueLink href={item.href} />
+      </div>
     </article>
+  );
+}
+
+/** The link to the whole issue. */
+function FullIssueLink({ href }: { href: string }) {
+  return (
+    <Link href={href} className={`inline-flex items-center gap-1 text-[13.5px] font-medium text-zk-accent hover:underline ${focus}`}>
+      Open the full issue
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
+    </Link>
   );
 }
 
@@ -459,12 +531,155 @@ function since(date: Date): string {
  */
 function StalledLabel({ item, className = "" }: { item: WorkFeedItem; className?: string }) {
   return (
-    <span className={`flex shrink-0 flex-col items-end gap-1 ${className}`}>
+    <span title={item.stallReason ?? undefined} className={`flex shrink-0 flex-col items-end gap-1 ${className}`}>
       <StatusBadge substatus={item.substatus} />
       {item.stalledSince ? (
         <span className="text-[11.5px] tabular-nums text-zk-muted" suppressHydrationWarning>{since(item.stalledSince)}</span>
       ) : null}
     </span>
+  );
+}
+
+/** What a person can do about stalled work (#stalled-fix): by themself, and what to ask their agent. */
+type Fix = {
+  /** The heading: what has to happen. */
+  title: string;
+  /** What you can do yourself, in a sentence. */
+  you: string;
+  /** The button for it: a link (the issue page, where the step is, or the pull request). */
+  action: { label: string; href: string; external?: boolean } | null;
+  /** Approve here, for delivered work waiting for its judgement. */
+  approve?: boolean;
+  /** What to paste to your agent, given the issue's full address. */
+  prompt: (url: string) => string;
+};
+
+function fixFor(item: WorkFeedItem): Fix {
+  const ref = `Ziki issue ${formatIssueNumber(item.number)}`;
+  const pr = item.pullRequestUrl;
+  const prLine = pr ? ` The pull request is ${pr}.` : "";
+  switch (item.substatus) {
+    case "in_progress":
+    case "plan_review":
+      if (!item.held) {
+        return {
+          title: "Get an agent on it again",
+          you: "Nobody holds it now. Open the issue to award an open bid, or assign it to your agent.",
+          action: { label: "Award or assign", href: item.href },
+          prompt: (url) => `${ref} (${url}) was let go and nobody is working on it. Read it, check the project's mistake registry, and bid on it with a short plan so it can be awarded to you.`,
+        };
+      }
+      return {
+        title: "Wake the agent or hand it on",
+        you: `${item.who ?? "The agent"} stopped checking in. If it's your agent, ask it to carry on. Otherwise, on the issue page the ⋯ menu gives it more time or stops it so the work can go to another agent.`,
+        action: { label: "Open the issue", href: item.href },
+        prompt: (url) => `Check ${ref} (${url}). If you hold the claim, carry on with the work and send a heartbeat now, or deliver what you have; if you can't finish it, release the claim so another agent can take it. If you don't hold it, bid on it so it can be handed to you.`,
+      };
+    case "requires_review":
+      return {
+        title: "Judge the delivery",
+        you: "Look at what was delivered and approve it if it works. Your approval counts as a test verdict.",
+        action: pr ? { label: "Look at the pull request", href: pr, external: true } : { label: "Open the issue", href: item.href },
+        approve: item.canApprove,
+        prompt: (url) => `Test the delivery on ${ref} (${url}).${prLine} Check out the change, run it, try what the issue describes, and post your verdict (good to merge or not) with a summary and screenshots as a test result.`,
+      };
+    case "accepted":
+      return {
+        title: "Give it a manager review",
+        you: "It needs a manager's review. If you're an owner or admin, give the merge review from the issue page, or ask your manager agent to.",
+        action: { label: "Review it", href: item.href },
+        prompt: (url) => `As a manager agent, review the pull request for ${ref} (${url}).${prLine} Read the diff against the issue and the mistake registry, then post a merge review: accept, or reject with the feedback the author should act on.`,
+      };
+    case "ready_to_merge":
+      return {
+        title: "Merge the pull request",
+        you: "It's accepted and only needs merging. Merge it from the issue's GitHub panel or on GitHub once its checks are green, or ask your merger agent.",
+        action: pr ? { label: "Merge on GitHub", href: pr, external: true } : { label: "Open the issue", href: item.href },
+        prompt: (url) => `As a merger agent, merge the pull request for ${ref} (${url}).${prLine} Check that it is mergeable and every check is green, merge it on GitHub, then report it merged and resolve the issue.`,
+      };
+    case "error":
+      return {
+        title: "Fix the pull request",
+        you: "The pull request can't merge. From the issue's GitHub panel you can update the branch, re-run failed checks or send it back to the agent that wrote it.",
+        action: { label: "Open the GitHub panel", href: item.href },
+        prompt: (url) => `The pull request for ${ref} (${url}) can't be merged.${prLine}${item.mergeHold ? ` Reason: ${item.mergeHold}` : ""} Bring the branch up to date with main, fix conflicts or failing checks, push, and report the pull request status when it can merge.`,
+      };
+    case "merged_broken":
+      return {
+        title: "Get it fixed",
+        you: "It was merged and judged broken. It takes bids for a fix: award one on the issue page, or have your agent bid.",
+        action: { label: "Open the issue", href: item.href },
+        prompt: (url) => `${ref} (${url}) was force-merged and judged broken.${prLine} Read the judgements on it, find what is wrong, and bid to fix it with a short plan.`,
+      };
+    default:
+      return {
+        title: "Move it on",
+        you: "Open the issue to see what step it waits for.",
+        action: { label: "Open the issue", href: item.href },
+        prompt: (url) => `Check ${ref} (${url}): it hasn't moved for a while. Find what step it waits for and take it if you can.`,
+      };
+  }
+}
+
+const noSubscribe = () => () => {};
+
+/**
+ * An opened stalled card's right (#stalled-fix): what has to happen, what you can do yourself with one button, and a
+ * message to copy and paste to your agent.
+ */
+function StalledFix({ item }: { item: WorkFeedItem }) {
+  const fix = fixFor(item);
+  // The issue's full address, for the agent; only known in the browser.
+  const origin = useSyncExternalStore(noSubscribe, () => window.location.origin, () => "");
+  const prompt = fix.prompt(`${origin}${item.href}`);
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <aside aria-label="How to fix it" className="min-w-0 pt-4">
+      <div className="rounded-xl border border-zk-border bg-zk-bg p-4">
+        <p className="m-0 text-[14px] font-semibold text-zk-text">{fix.title}</p>
+        <p className="m-0 mt-1 text-[13px] leading-relaxed text-zk-text2">{fix.you}</p>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {fix.approve ? <DeliveredActions item={item} /> : null}
+          {fix.action ? (
+            fix.action.external ? (
+              <a href={fix.action.href} target="_blank" rel="noopener noreferrer" className={`inline-flex min-h-8 items-center gap-1 rounded-[9px] bg-electric-blue-strong px-3 text-[13px] font-semibold text-white transition hover:opacity-90 ${focus}`}>
+                {fix.action.label}
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg>
+              </a>
+            ) : (
+              <Link href={fix.action.href} className={`inline-flex min-h-8 items-center gap-1 rounded-[9px] bg-electric-blue-strong px-3 text-[13px] font-semibold text-white transition hover:opacity-90 ${focus}`}>
+                {fix.action.label}
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
+              </Link>
+            )
+          ) : null}
+        </div>
+        <div className="mt-4 border-t border-zk-divider pt-3">
+          <div className="flex items-center justify-between gap-2">
+            <p className="m-0 text-[12px] font-semibold uppercase tracking-[0.06em] text-zk-muted">Or ask your agent</p>
+            <button type="button" onClick={() => void copy()} className={`inline-flex h-7 cursor-pointer items-center gap-1 rounded-md border border-zk-border bg-white px-2 text-[12px] font-semibold text-zk-text transition hover:bg-zk-chip ${focus}`}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                {copied ? <path d="m5 12 5 5 9-10" /> : <path d="M9 9h10v10H9zM5 15V5h10" />}
+              </svg>
+              {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <p className="m-0 mt-2 whitespace-pre-wrap break-words rounded-lg border border-zk-border bg-white px-3 py-2 font-mono text-[12px] leading-relaxed text-zk-text2" suppressHydrationWarning>
+            {prompt}
+          </p>
+          <span aria-live="polite" className="sr-only">{copied ? "Copied to the clipboard" : ""}</span>
+        </div>
+      </div>
+    </aside>
   );
 }
 
@@ -480,9 +695,14 @@ function Timeline({ item }: { item: WorkFeedItem }) {
     ? { label: WAITING_FOR_MERGE.has(item.substatus) ? "Waiting for merge" : "Waiting for review", value: since(item.deliveredAt) }
     : null;
   const rows: { label: string; value: React.ReactNode }[] = [
-    { label: "Added", value: <LocalTime date={item.addedAt} /> },
-    { label: "Started", value: item.startedAt ? <LocalTime date={item.startedAt} /> : "Not yet" },
-    { label: "Delivered", value: item.deliveredAt ? <LocalTime date={item.deliveredAt} /> : "Not yet" },
+    // Exact times ("Nov 19, 2026, 2:02 PM"), not "yesterday": the timeline tells how long each step took.
+    { label: "Added", value: <LocalTime date={item.addedAt} absolute yearIfOld /> },
+    { label: "Started", value: item.startedAt ? <LocalTime date={item.startedAt} absolute yearIfOld /> : "Not yet" },
+    { label: "Delivered", value: item.deliveredAt ? <LocalTime date={item.deliveredAt} absolute yearIfOld /> : "Not yet" },
+    // Merged (#work-feed): when its pull request was merged and by whom, once a report says so.
+    ...(item.merged
+      ? [{ label: "Merged", value: <><LocalTime date={item.merged.at} absolute yearIfOld />{item.merged.by ? <span className="text-zk-muted"> by <span className="font-medium text-zk-text2">{item.merged.by}</span></span> : null}</> }]
+      : item.deliveredAt ? [{ label: "Merged", value: "Not yet" }] : []),
   ];
   return (
     <dl className="m-0 mt-4 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-[13px]">
@@ -504,22 +724,30 @@ function Timeline({ item }: { item: WorkFeedItem }) {
 
 function DeliveryPreview({ item }: { item: WorkFeedItem }) {
   const [first, ...rest] = item.screenshots;
+  // Every screenshot, now then before, opens large in one preview that steps through them all (#screenshot-preview).
+  const shots: PreviewShot[] = [
+    ...item.screenshots.map((url, index) => ({ url, label: index === 0 ? `Delivered work for ${formatIssueNumber(item.number)}` : `Screenshot ${index + 1}` })),
+    ...item.beforeScreenshots.map((url, index) => ({ url, label: `Before the work, screenshot ${index + 1}` })),
+  ];
+  const [opened, setOpened] = useState<number | null>(null);
+  const before = item.screenshots.length;
   return (
     <aside aria-label="Preview" className="min-w-0 pt-4">
+      <ScreenshotPreview shots={shots} index={opened} onIndex={setOpened} onClose={() => setOpened(null)} />
       {first && item.beforeScreenshots.length > 0 ? <p className="m-0 mb-1.5 text-[12px] font-semibold uppercase tracking-[0.06em] text-zk-muted">Now</p> : null}
       {first ? (
         <div className="flex flex-col gap-2">
-          <a href={first} target="_blank" rel="noopener noreferrer" className={`block overflow-hidden rounded-xl border border-zk-border bg-zk-bg ${focus}`}>
+          <button type="button" onClick={() => setOpened(0)} aria-label="Preview the screenshot" className={`block w-full cursor-zoom-in overflow-hidden rounded-xl border border-zk-border bg-zk-bg ${focus}`}>
             {/* eslint-disable-next-line @next/next/no-img-element -- a screenshot the agent linked, any host */}
             <img src={first} alt={`Screenshot of the delivered work for ${formatIssueNumber(item.number)}`} loading="lazy" className="aspect-[4/3] w-full object-cover object-top" />
-          </a>
+          </button>
           {rest.length > 0 ? (
             <div className="grid grid-cols-3 gap-2">
               {rest.map((url, index) => (
-                <a key={url} href={url} target="_blank" rel="noopener noreferrer" className={`block overflow-hidden rounded-lg border border-zk-border bg-zk-bg ${focus}`}>
+                <button key={url} type="button" onClick={() => setOpened(index + 1)} aria-label={`Preview screenshot ${index + 2}`} className={`block w-full cursor-zoom-in overflow-hidden rounded-lg border border-zk-border bg-zk-bg ${focus}`}>
                   {/* eslint-disable-next-line @next/next/no-img-element -- a screenshot the agent linked, any host */}
                   <img src={url} alt={`Screenshot ${index + 2}`} loading="lazy" className="aspect-[4/3] w-full object-cover object-top" />
-                </a>
+                </button>
               ))}
             </div>
           ) : null}
@@ -536,22 +764,52 @@ function DeliveryPreview({ item }: { item: WorkFeedItem }) {
           <p className="m-0 mb-1.5 text-[12px] font-semibold uppercase tracking-[0.06em] text-zk-muted">Before</p>
           <div className="grid grid-cols-3 gap-2">
             {item.beforeScreenshots.map((url, index) => (
-              <a key={url} href={url} target="_blank" rel="noopener noreferrer" className={`block overflow-hidden rounded-lg border border-zk-border bg-zk-bg ${focus}`}>
+              <button key={url} type="button" onClick={() => setOpened(before + index)} aria-label={`Preview before screenshot ${index + 1}`} className={`block w-full cursor-zoom-in overflow-hidden rounded-lg border border-zk-border bg-zk-bg ${focus}`}>
                 {/* eslint-disable-next-line @next/next/no-img-element -- a screenshot the agent linked, any host */}
                 <img src={url} alt={`Before the work, screenshot ${index + 1}`} loading="lazy" className="aspect-[4/3] w-full object-cover object-top" />
-              </a>
+              </button>
             ))}
           </div>
         </div>
       ) : null}
       <Timeline item={item} />
-      {item.viewUrl ? (
-        <a href={item.viewUrl} target="_blank" rel="noopener noreferrer" className={`mt-3 inline-flex items-center gap-1 text-[13.5px] font-medium text-zk-accent hover:underline ${focus}`}>
-          View what was delivered
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg>
-        </a>
+      {/* Where it runs and its pull request, as two links. Live work without a live link says so (#live-link). */}
+      {item.liveUrl || item.pullRequestUrl || item.kind === "live" ? (
+        <div className="mt-3 flex flex-col gap-1.5">
+          {item.liveUrl ? (
+            <OutLink href={item.liveUrl} label={item.kind === "live" ? "See it live" : "See it running"} />
+          ) : item.kind === "live" ? (
+            <p className="m-0 text-[13px] text-zk-muted">
+              <span className="font-medium text-zk-text2">No live link added yet.</span> The merger agent is asked to add one.
+            </p>
+          ) : null}
+          {item.pullRequestUrl ? <OutLink href={item.pullRequestUrl} label="Pull request" /> : null}
+        </div>
       ) : null}
     </aside>
+  );
+}
+
+/** A link out of Ziki, with the arrow that says so. */
+function OutLink({ href, label }: { href: string; label: string }) {
+  return (
+    <a href={href} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 text-[13.5px] font-medium text-zk-accent hover:underline ${focus}`}>
+      {label}
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg>
+    </a>
+  );
+}
+
+/** Above an Approve: the one-word state the work is in, small, in its colour and with its icon. */
+function StateLine({ substatus }: { substatus: Substatus }) {
+  const badge = STATUS_BADGE[substatus];
+  return (
+    <span className="inline-flex items-center gap-1 text-[11.5px] font-semibold leading-none" style={{ color: PILL_TONES[badge.tone].color }}>
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="shrink-0">
+        <path d={badge.icon} />
+      </svg>
+      {badge.label}
+    </span>
   );
 }
 
@@ -564,6 +822,11 @@ function ConfirmLive({ item, className = "" }: { item: WorkFeedItem; className?:
   const [done, setDone] = useState(item.confirmed);
   const [error, setError] = useState<string | null>(null);
   const router = useRouter();
+  // Approved just now, here: Send some Love shows, and the card stays until it is sent (then the feed refreshes and the
+  // work moves to Delivered).
+  const [justApproved, setJustApproved] = useState(false);
+  const [loving, setLoving] = useState(false);
+  const [cheering, setCheering] = useState(false);
   const confirm = () =>
     start(async () => {
       setError(null);
@@ -571,13 +834,36 @@ function ConfirmLive({ item, className = "" }: { item: WorkFeedItem; className?:
       if ("error" in result) setError(result.error);
       else {
         setDone(true);
-        router.refresh();
+        setJustApproved(true);
+        // Approved (#just-delivered): fireworks, once.
+        setCheering(true);
+        setTimeout(() => setCheering(false), 2400);
       }
     });
+  const sendLove = () => {
+    setLoving(true);
+    setTimeout(() => {
+      setLoving(false);
+      setJustApproved(false);
+      router.refresh();
+    }, 2600);
+  };
   const button = `${PILL} transition ${focus}`;
   return (
     <div className={`flex flex-col items-end gap-1 ${className}`}>
-      {done ? (
+      <StateLine substatus={item.substatus} />
+      {done && justApproved ? (
+        // After Approve (#just-delivered): thank whoever delivered it, with fireworks and hearts.
+        <button
+          type="button"
+          onClick={sendLove}
+          disabled={loving}
+          className="inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 whitespace-nowrap rounded-md border border-[#e0335a] bg-[#ef4f6b] px-2 text-[11.5px] font-bold text-white shadow-[0_1px_2px_rgba(0,0,0,0.18)] transition hover:brightness-110 active:translate-y-px active:shadow-none disabled:cursor-default focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-electric-blue"
+        >
+          <span aria-hidden="true">♥</span>
+          {loving ? "Love sent!" : "Send some Love"}
+        </button>
+      ) : done ? (
         <span className={button} style={PILL_TONES.green}>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m5 12 5 5 9-10" /></svg>
           Confirmed
@@ -589,6 +875,31 @@ function ConfirmLive({ item, className = "" }: { item: WorkFeedItem; className?:
         </button>
       )}
       {error ? <p role="alert" className="m-0 max-w-[220px] text-[12px] text-zk-bad-fg">{error}</p> : null}
+      {loving || cheering ? (
+        <span aria-hidden="true" className="pointer-events-none fixed inset-0 z-50">
+          <CelebrationStyles />
+          <Fireworks />
+          {loving ? <Hearts /> : null}
+        </span>
+      ) : null}
+      <span aria-live="polite" className="sr-only">{loving ? "Love sent" : ""}</span>
+    </div>
+  );
+}
+
+/**
+ * The top of the newest delivery's card (#just-delivered): an agent dancing, "<name> just delivered this", and
+ * fireworks going off behind it.
+ */
+function JustDelivered({ by }: { by: string | null }) {
+  const name = by?.trim().split(/\s+/)[0] || "Your agent";
+  return (
+    <div className="relative flex items-center gap-2.5 overflow-hidden border-b border-[#f3e7c9] bg-gradient-to-r from-[#fffbf1] to-white px-5 py-2">
+      {/* Still until Approve: the fireworks go off when it is approved. */}
+      <DancingAgent size={28} still />
+      <p className="relative m-0 text-[13px] font-medium text-zk-text2">
+        {name} just delivered this <span aria-hidden="true">🎉</span>
+      </p>
     </div>
   );
 }
@@ -611,7 +922,8 @@ function DeliveredActions({ item, className = "" }: { item: WorkFeedItem; classN
       else setDone(true);
     });
   return (
-    <div className={`flex flex-col gap-1 ${className}`}>
+    <div className={`flex flex-col items-end gap-1 ${className}`}>
+      <StateLine substatus={item.substatus} />
       <div className="flex items-center gap-1.5">
         {done ? (
           <span className={button} style={PILL_TONES.green}>
@@ -628,4 +940,80 @@ function DeliveredActions({ item, className = "" }: { item: WorkFeedItem; classN
       {error ? <p role="alert" className="m-0 max-w-[220px] text-[12px] text-red-600">{error}</p> : null}
     </div>
   );
+}
+
+/** A new idea that needs your OK (#just-added): open, and you haven't given it a verdict yet. */
+export type JustAddedIdea = { id: string; number: number; title: string; at: Date; by: string | null; href: string };
+
+/**
+ * New ideas at the top of Needs your OK (#just-added): each highlighted as something to do, with Approve (your good
+ * verdict, as on the ideas list). The one the chat has just filed flashes, so it is clear where it went.
+ */
+function IdeaOkCards({ ideas, flash }: { ideas: JustAddedIdea[]; flash: number | null }) {
+  return (
+    <>
+      <style>{`
+@keyframes zk-flash { 0%, 100% { box-shadow: 0 0 0 0 rgba(47,140,240,0) } 20%, 60% { box-shadow: 0 0 0 4px rgba(47,140,240,0.35) } }
+@media (prefers-reduced-motion: reduce) { .zk-flash { animation: none !important; box-shadow: 0 0 0 3px rgba(47,140,240,0.4) } }
+`}</style>
+      {ideas.map((idea) => <IdeaOkCard key={idea.id} idea={idea} flashing={idea.number === flash} />)}
+    </>
+  );
+}
+
+function IdeaOkCard({ idea, flashing }: { idea: JustAddedIdea; flashing: boolean }) {
+  const [approved, setApproved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, start] = useTransition();
+  const approve = () => {
+    setError(null);
+    setApproved(true);
+    start(async () => {
+      let message: string | null;
+      try {
+        message = (await quickIdeaVerdictAction(idea.id, "good"))?.error ?? null;
+      } catch {
+        message = "Could not save that. Please try again.";
+      }
+      if (message) {
+        setApproved(false);
+        setError(message);
+      }
+    });
+  };
+  return (
+    <li>
+      <div
+        className={`flex items-center gap-4 rounded-2xl border border-[#bcd7fb] border-l-4 border-l-electric-blue-strong bg-[#f5f9ff] px-5 py-3.5 ${flashing ? "zk-flash" : ""}`}
+        style={flashing ? { animation: "zk-flash 1.6s ease-in-out 3" } : undefined}
+      >
+        <Link href={idea.href} className={`flex min-w-0 flex-1 items-center gap-4 rounded-lg ${focus}`}>
+          <IssueThumb item={{ title: idea.title, files: [] }} />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[15px] font-semibold text-zk-text">{cleanTitle(idea.title)}</span>
+            <span className="mt-0.5 block truncate text-[13px] text-zk-muted">
+              <span className="font-semibold text-electric-blue-strong">{flashing ? "Just added" : "New idea"}</span> · Idea #{idea.number}
+              {idea.by ? ` · ${idea.by}` : ""} · <LocalTime date={idea.at} />
+            </span>
+          </span>
+        </Link>
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          {approved ? (
+            <span className={PILL} style={PILL_TONES.green}>✓ Approved</span>
+          ) : (
+            <button type="button" onClick={approve} disabled={pending} aria-label={`Approve idea #${idea.number}: give it your good verdict`} className={RAISED}>
+              <ThumbsUp />
+              Approve
+            </button>
+          )}
+          {error ? <p role="alert" className="m-0 max-w-[220px] text-[12px] text-zk-bad-fg">{error}</p> : null}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+/** A description's first paragraph that isn't a heading: what an issue without a summary shows when opened. */
+function firstParagraph(body: string): string {
+  return body.split(/\n\s*\n/).map((part) => part.trim()).find((part) => part && !part.startsWith("#")) ?? body.trim();
 }
