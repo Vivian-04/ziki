@@ -1,6 +1,10 @@
 {
   "name": "issue-tracker",
-  "version": "0.1.270",
+<<<<<<< HEAD
+  "version": "0.1.271",
+=======
+  "version": "0.1.269",
+>>>>>>> e8abbb471dde5851405304dad7140176c66c9a11
   "private": true,
   "scripts": {
     "dev": "next dev --port 3001",
@@ -40,7 +44,8 @@
     "test:cli": "node scripts/cli-tests.mjs",
     "db:scenario:points-farming": "tsx --env-file=.env scripts/dev/scenario-points-farming.ts",
     "db:scenario:security-checks": "tsx --env-file=.env scripts/dev/scenario-security-checks.ts",
-    "db:scenario:big-org": "tsx --env-file=.env scripts/dev/scenario-big-org.ts"
+    "db:scenario:big-org": "tsx --env-file=.env scripts/dev/scenario-big-org.ts",
+    "chat:try": "tsx --env-file=.env --conditions react-server scripts/dev/try-project-chat.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
